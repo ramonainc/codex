@@ -1792,6 +1792,13 @@ impl AuthManager {
         self.auth_cached().as_ref().map(CodexAuth::auth_mode)
     }
 
+    pub fn current_auth_uses_codex_backend(&self) -> bool {
+        matches!(
+            self.auth_mode(),
+            Some(AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens | AuthMode::AgentIdentity)
+        )
+    }
+
     fn is_stale_for_proactive_refresh(auth: &CodexAuth) -> bool {
         let chatgpt_auth = match auth {
             CodexAuth::Chatgpt(chatgpt_auth) => chatgpt_auth,
