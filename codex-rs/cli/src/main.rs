@@ -404,7 +404,22 @@ struct LoginCommand {
 #[derive(Debug, clap::Subcommand)]
 enum LoginSubcommand {
     /// Show login status.
-    Status,
+    Status(LoginStatusCommand),
+}
+
+#[derive(Debug, Parser)]
+struct LoginStatusCommand {
+    /// Emit a machine-readable JSON payload to stdout.
+    #[arg(long = "json", default_value_t = false)]
+    json: bool,
+
+    /// Refresh managed ChatGPT auth before reporting status.
+    #[arg(long = "refresh", default_value_t = false)]
+    refresh: bool,
+
+    /// Include ChatGPT rate-limit snapshots in the response.
+    #[arg(long = "rate-limits", default_value_t = false)]
+    rate_limits: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -1081,8 +1096,14 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 root_config_overrides.clone(),
             );
             match login_cli.action {
-                Some(LoginSubcommand::Status) => {
-                    run_login_status(login_cli.config_overrides).await;
+                Some(LoginSubcommand::Status(status_cli)) => {
+                    run_login_status(
+                        login_cli.config_overrides,
+                        status_cli.json,
+                        status_cli.refresh,
+                        status_cli.rate_limits,
+                    )
+                    .await;
                 }
                 None => {
                     if login_cli.with_api_key && login_cli.with_access_token {
