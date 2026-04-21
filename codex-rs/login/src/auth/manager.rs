@@ -16,10 +16,16 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use tokio::sync::Semaphore;
 
+use codex_agent_identity::AgentIdentityKey;
+use codex_agent_identity::AgentTaskAuthorizationTarget;
+use codex_agent_identity::authorization_header_for_agent_task;
 use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::AuthMode as ApiAuthMode;
+use codex_auth_provider::AuthProvider;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::ModelProviderAuthInfo;
+use http::HeaderMap;
+use http::HeaderValue;
 
 use super::external_bearer::BearerTokenRefresher;
 use super::revoke::revoke_auth_tokens;
@@ -55,6 +61,19 @@ pub enum CodexAuth {
 impl PartialEq for CodexAuth {
     fn eq(&self, other: &Self) -> bool {
         self.api_auth_mode() == other.api_auth_mode()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CodexAuthProvider {
+    auth: CodexAuth,
+}
+
+impl CodexAuthProvider {
+    pub fn to_auth_headers(&self) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        self.add_auth_headers(&mut headers);
+        headers
     }
 }
 
@@ -316,6 +335,10 @@ impl CodexAuth {
         }
     }
 
+    pub fn provider(&self) -> CodexAuthProvider {
+        CodexAuthProvider { auth: self.clone() }
+    }
+
     pub async fn initialize_runtime(
         &self,
         chatgpt_base_url: Option<String>,
@@ -397,6 +420,20 @@ impl CodexAuth {
         })
     }
 
+    pub fn is_workspace_account(&self) -> bool {
+        matches!(
+            self.account_plan_type(),
+            Some(
+                AccountPlanType::Team
+                    | AccountPlanType::SelfServeBusinessUsageBased
+                    | AccountPlanType::Business
+                    | AccountPlanType::EnterpriseCbpUsageBased
+                    | AccountPlanType::Enterprise
+                    | AccountPlanType::Edu
+            )
+        )
+    }
+
     /// Returns `None` if token-backed ChatGPT auth is unavailable.
     fn get_current_auth_json(&self) -> Option<AuthDotJson> {
         let state = match self {
@@ -445,6 +482,52 @@ impl CodexAuth {
         Self::ApiKey(ApiKeyAuth {
             api_key: api_key.to_owned(),
         })
+    }
+}
+
+impl AuthProvider for CodexAuthProvider {
+    fn add_auth_headers(&self, headers: &mut HeaderMap) {
+        let header_value = match &self.auth {
+            CodexAuth::AgentIdentity(auth) => {
+                let record = auth.record();
+                let process_task_id = auth.process_task_id.get().ok_or_else(|| {
+                    std::io::Error::other("agent identity process task is not initialized")
+                });
+                process_task_id.and_then(|task_id| {
+                    authorization_header_for_agent_task(
+                        AgentIdentityKey {
+                            agent_runtime_id: &record.agent_runtime_id,
+                            private_key_pkcs8_base64: &record.agent_private_key,
+                        },
+                        AgentTaskAuthorizationTarget {
+                            agent_runtime_id: &record.agent_runtime_id,
+                            task_id,
+                        },
+                    )
+                    .map_err(std::io::Error::other)
+                })
+            }
+            CodexAuth::ApiKey(auth) => Ok(format!("Bearer {}", auth.api_key)),
+            CodexAuth::Chatgpt(_) | CodexAuth::ChatgptAuthTokens(_) => {
+                self.auth.get_token().map(|token| format!("Bearer {token}"))
+            }
+        };
+
+        if let Ok(header_value) = header_value
+            && let Ok(header) = HeaderValue::from_str(&header_value)
+        {
+            let _ = headers.insert(http::header::AUTHORIZATION, header);
+        }
+
+        if let Some(account_id) = self.auth.get_account_id()
+            && let Ok(header) = HeaderValue::from_str(&account_id)
+        {
+            let _ = headers.insert("ChatGPT-Account-ID", header);
+        }
+
+        if self.auth.is_fedramp_account() {
+            let _ = headers.insert("X-OpenAI-Fedramp", HeaderValue::from_static("true"));
+        }
     }
 }
 

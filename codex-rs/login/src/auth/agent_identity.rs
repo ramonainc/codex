@@ -13,7 +13,7 @@ const DEFAULT_CHATGPT_BACKEND_BASE_URL: &str = "https://chatgpt.com/backend-api"
 #[derive(Debug)]
 pub struct AgentIdentityAuth {
     record: AgentIdentityAuthRecord,
-    process_task_id: Arc<OnceCell<String>>,
+    pub(super) process_task_id: Arc<OnceCell<String>>,
 }
 
 impl Clone for AgentIdentityAuth {
