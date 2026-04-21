@@ -19,6 +19,7 @@ use std::sync::Mutex;
 use tracing::warn;
 
 use crate::token_data::TokenData;
+use crate::token_data::decode_jwt_payload;
 use codex_app_server_protocol::AuthMode;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_keyring_store::DefaultKeyringStore;
@@ -41,7 +42,11 @@ pub struct AuthDotJson {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_refresh: Option<DateTime<Utc>>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_agent_identity"
+    )]
     pub agent_identity: Option<AgentIdentityAuthRecord>,
 }
 
@@ -54,6 +59,58 @@ pub struct AgentIdentityAuthRecord {
     pub email: String,
     pub plan_type: AccountPlanType,
     pub chatgpt_account_is_fedramp: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AgentIdentityAuthInput {
+    Record(AgentIdentityAuthRecord),
+    Jwt(String),
+}
+
+#[derive(Deserialize)]
+struct AgentIdentityJwtClaims {
+    agent_runtime_id: String,
+    agent_private_key: String,
+    account_id: String,
+    chatgpt_user_id: String,
+    email: String,
+    plan_type: AccountPlanType,
+    chatgpt_account_is_fedramp: bool,
+}
+
+impl AgentIdentityAuthRecord {
+    pub(crate) fn from_agent_identity_jwt(jwt: &str) -> std::io::Result<Self> {
+        let claims: AgentIdentityJwtClaims =
+            decode_jwt_payload(jwt).map_err(std::io::Error::other)?;
+
+        Ok(Self {
+            agent_runtime_id: claims.agent_runtime_id,
+            agent_private_key: claims.agent_private_key,
+            account_id: claims.account_id,
+            chatgpt_user_id: claims.chatgpt_user_id,
+            email: claims.email,
+            plan_type: claims.plan_type,
+            chatgpt_account_is_fedramp: claims.chatgpt_account_is_fedramp,
+        })
+    }
+}
+
+fn deserialize_agent_identity<'de, D>(
+    deserializer: D,
+) -> Result<Option<AgentIdentityAuthRecord>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<AgentIdentityAuthInput>::deserialize(deserializer)? {
+        Some(AgentIdentityAuthInput::Record(record)) => Ok(Some(record)),
+        Some(AgentIdentityAuthInput::Jwt(jwt)) => {
+            AgentIdentityAuthRecord::from_agent_identity_jwt(&jwt)
+                .map(Some)
+                .map_err(serde::de::Error::custom)
+        }
+        None => Ok(None),
+    }
 }
 
 pub(super) fn get_auth_file(codex_home: &Path) -> PathBuf {

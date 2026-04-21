@@ -82,6 +82,65 @@ async fn file_storage_round_trips_agent_identity_auth() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn file_storage_loads_agent_identity_from_jwt() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+    let expected_record = AgentIdentityAuthRecord {
+        agent_runtime_id: "agent-runtime-id".to_string(),
+        agent_private_key: "private-key".to_string(),
+        account_id: "account-id".to_string(),
+        chatgpt_user_id: "user-id".to_string(),
+        email: "user@example.com".to_string(),
+        plan_type: AccountPlanType::Pro,
+        chatgpt_account_is_fedramp: false,
+    };
+    let agent_identity_jwt = jwt_with_payload(json!({
+        "agent_runtime_id": expected_record.agent_runtime_id,
+        "agent_private_key": expected_record.agent_private_key,
+        "account_id": expected_record.account_id,
+        "chatgpt_user_id": expected_record.chatgpt_user_id,
+        "email": expected_record.email,
+        "plan_type": expected_record.plan_type,
+        "chatgpt_account_is_fedramp": expected_record.chatgpt_account_is_fedramp,
+    }));
+    let auth_file = get_auth_file(codex_home.path());
+    std::fs::write(
+        &auth_file,
+        serde_json::to_string_pretty(&json!({
+            "auth_mode": "agentIdentity",
+            "agent_identity": agent_identity_jwt,
+        }))?,
+    )?;
+
+    let loaded = storage.load()?;
+
+    assert_eq!(
+        loaded.expect("auth should load").agent_identity,
+        Some(expected_record)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn file_storage_rejects_invalid_agent_identity_jwt() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+    let auth_file = get_auth_file(codex_home.path());
+    std::fs::write(
+        &auth_file,
+        serde_json::to_string_pretty(&json!({
+            "auth_mode": "agentIdentity",
+            "agent_identity": "not-a-jwt",
+        }))?,
+    )?;
+
+    let err = storage.load().expect_err("invalid JWT should fail");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    Ok(())
+}
+
 #[test]
 fn file_storage_delete_removes_auth_file() -> anyhow::Result<()> {
     let dir = tempdir()?;
@@ -215,6 +274,14 @@ fn auth_with_prefix(prefix: &str) -> AuthDotJson {
         last_refresh: None,
         agent_identity: None,
     }
+}
+
+fn jwt_with_payload(payload: serde_json::Value) -> String {
+    let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let header_b64 = encode(br#"{"alg":"none","typ":"JWT"}"#);
+    let payload_b64 = encode(&serde_json::to_vec(&payload).expect("payload should serialize"));
+    let signature_b64 = encode(b"sig");
+    format!("{header_b64}.{payload_b64}.{signature_b64}")
 }
 
 #[test]
