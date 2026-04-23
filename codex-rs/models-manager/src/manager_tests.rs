@@ -8,6 +8,7 @@ use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_model_provider_info::WireApi;
 use codex_protocol::config_types::ModelProviderAuthInfo;
+use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use core_test_support::responses::mount_models_once;
@@ -875,4 +876,11 @@ fn bundled_models_json_roundtrips() {
         !response.models.is_empty(),
         "bundled models.json should contain at least one model"
     );
+
+    let default_model = &response.models[0];
+    assert_eq!(default_model.slug, "gpt-5.5");
+    assert_eq!(default_model.context_window, Some(1_000_000));
+    assert_eq!(default_model.max_context_window, Some(1_000_000));
+    assert_eq!(default_model.priority, 1);
+    assert_eq!(default_model.visibility, ModelVisibility::List);
 }
