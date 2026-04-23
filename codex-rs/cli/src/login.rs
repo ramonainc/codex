@@ -577,6 +577,10 @@ pub async fn run_login_status(
                 eprintln!("Logged in using ChatGPT");
                 std::process::exit(0);
             }
+            AuthMode::AgentIdentity => {
+                eprintln!("Logged in using Agent Identity");
+                std::process::exit(0);
+            }
         },
         Ok(None) => {
             eprintln!("Not logged in");
