@@ -10,6 +10,27 @@ use codex_keyring_store::tests::MockKeyringStore;
 use codex_protocol::account::PlanType as AccountPlanType;
 use keyring::Error as KeyringError;
 
+#[test]
+fn auth_file_defaults_to_codex_home_auth_json() {
+    let codex_home = PathBuf::from("/tmp/codex-home");
+
+    let auth_file = get_auth_file_from_env(&codex_home, None);
+
+    assert_eq!(PathBuf::from("/tmp/codex-home/auth.json"), auth_file);
+}
+
+#[test]
+fn auth_file_env_override_wins_when_set() {
+    let codex_home = PathBuf::from("/tmp/codex-home");
+
+    let auth_file = get_auth_file_from_env(
+        &codex_home,
+        Some(std::ffi::OsString::from("/tmp/lease/auth.json")),
+    );
+
+    assert_eq!(PathBuf::from("/tmp/lease/auth.json"), auth_file);
+}
+
 #[tokio::test]
 async fn file_storage_load_returns_auth_dot_json() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
