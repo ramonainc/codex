@@ -2132,6 +2132,7 @@ dependencies = [
  "predicates",
  "pretty_assertions",
  "regex-lite",
+ "reqwest",
  "serde",
  "serde_json",
  "sqlx",
@@ -2142,6 +2143,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "wiremock",
 ]
 
 [[package]]

@@ -26,6 +26,8 @@ use codex_keyring_store::KeyringStore;
 use codex_protocol::account::PlanType as AccountPlanType;
 use once_cell::sync::Lazy;
 
+const CODEX_AUTH_FILE_ENV: &str = "CODEX_AUTH_FILE";
+
 /// Expected structure for $CODEX_HOME/auth.json.
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
 pub struct AuthDotJson {
@@ -57,7 +59,14 @@ pub struct AgentIdentityAuthRecord {
 }
 
 pub(super) fn get_auth_file(codex_home: &Path) -> PathBuf {
-    codex_home.join("auth.json")
+    get_auth_file_from_env(codex_home, std::env::var_os(CODEX_AUTH_FILE_ENV))
+}
+
+fn get_auth_file_from_env(codex_home: &Path, auth_file_env: Option<std::ffi::OsString>) -> PathBuf {
+    match auth_file_env {
+        Some(value) if !value.is_empty() => PathBuf::from(value),
+        _ => codex_home.join("auth.json"),
+    }
 }
 
 pub(super) fn delete_file_if_exists(codex_home: &Path) -> std::io::Result<bool> {
