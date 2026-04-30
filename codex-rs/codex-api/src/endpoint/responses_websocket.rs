@@ -620,7 +620,7 @@ async fn run_websocket_response_stream(
                         continue;
                     }
                 };
-                next_response_event_deadline = Instant::now() + idle_timeout;
+                let mut made_response_progress = false;
                 let model_verifications = event.model_verifications();
                 if event.kind() == "codex.rate_limits" {
                     if let Some(snapshot) = parse_rate_limit_event(&text) {
@@ -635,20 +635,24 @@ async fn run_websocket_response_stream(
                         .send(Ok(ResponseEvent::ServerModel(model.clone())))
                         .await;
                     last_server_model = Some(model);
+                    made_response_progress = true;
                 }
-                if let Some(verifications) = model_verifications
-                    && tx_event
+                if let Some(verifications) = model_verifications {
+                    made_response_progress = true;
+                    if tx_event
                         .send(Ok(ResponseEvent::ModelVerifications(verifications)))
                         .await
                         .is_err()
-                {
-                    return Err(ApiError::Stream(
-                        "response event consumer dropped".to_string(),
-                    ));
+                    {
+                        return Err(ApiError::Stream(
+                            "response event consumer dropped".to_string(),
+                        ));
+                    }
                 }
                 match process_responses_event(event) {
                     Ok(Some(event)) => {
                         let is_completed = matches!(event, ResponseEvent::Completed { .. });
+                        made_response_progress = true;
                         let _ = tx_event.send(Ok(event)).await;
                         if is_completed {
                             break;
@@ -658,6 +662,9 @@ async fn run_websocket_response_stream(
                     Err(error) => {
                         return Err(error.into_api_error());
                     }
+                }
+                if made_response_progress {
+                    next_response_event_deadline = Instant::now() + idle_timeout;
                 }
             }
             Message::Binary(_) => {
@@ -720,6 +727,45 @@ mod tests {
             loop {
                 if tx_message
                     .send(Ok(Message::Pong(Vec::new().into())))
+                    .is_err()
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        let result = timeout(
+            Duration::from_millis(500),
+            run_websocket_response_stream(
+                &mut ws_stream,
+                tx_event,
+                json!({ "type": "response.create" }),
+                Duration::from_millis(50),
+                None,
+                false,
+            ),
+        )
+        .await
+        .expect("semantic idle timeout should fire before test timeout");
+
+        keepalive_task.abort();
+        let Err(ApiError::Stream(message)) = result else {
+            panic!("expected websocket stream idle error");
+        };
+        assert_eq!(message, "idle timeout waiting for websocket response event");
+    }
+
+    #[tokio::test]
+    async fn websocket_idle_timeout_ignores_unforwarded_response_events() {
+        let (mut ws_stream, tx_message) = fake_ws_stream();
+        let (tx_event, _rx_event) = mpsc::channel(8);
+        let keepalive_task = tokio::spawn(async move {
+            loop {
+                if tx_message
+                    .send(Ok(Message::Text(
+                        json!({ "type": "response.in_progress" }).to_string().into(),
+                    )))
                     .is_err()
                 {
                     break;

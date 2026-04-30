@@ -439,10 +439,18 @@ pub async fn process_sse(
     let mut stream = stream.eventsource();
     let mut response_error: Option<ApiError> = None;
     let mut last_server_model: Option<String> = None;
+    let mut next_response_event_deadline = Instant::now() + idle_timeout;
 
     loop {
         let start = Instant::now();
-        let response = timeout(idle_timeout, stream.next()).await;
+        let remaining = next_response_event_deadline.saturating_duration_since(start);
+        if remaining.is_zero() {
+            let _ = tx_event
+                .send(Err(ApiError::Stream("idle timeout waiting for SSE".into())))
+                .await;
+            return;
+        }
+        let response = timeout(remaining, stream.next()).await;
         if let Some(t) = telemetry.as_ref() {
             t.on_sse_poll(&response, start.elapsed());
         }
@@ -478,6 +486,7 @@ pub async fn process_sse(
             }
         };
         let model_verifications = event.model_verifications();
+        let mut made_response_progress = false;
 
         if let Some(model) = event.response_model()
             && last_server_model.as_deref() != Some(model.as_str())
@@ -490,19 +499,23 @@ pub async fn process_sse(
                 return;
             }
             last_server_model = Some(model);
+            made_response_progress = true;
         }
-        if let Some(verifications) = model_verifications
-            && tx_event
+        if let Some(verifications) = model_verifications {
+            made_response_progress = true;
+            if tx_event
                 .send(Ok(ResponseEvent::ModelVerifications(verifications)))
                 .await
                 .is_err()
-        {
-            return;
+            {
+                return;
+            }
         }
 
         match process_responses_event(event) {
             Ok(Some(event)) => {
                 let is_completed = matches!(event, ResponseEvent::Completed { .. });
+                made_response_progress = true;
                 if tx_event.send(Ok(event)).await.is_err() {
                     return;
                 }
@@ -515,6 +528,9 @@ pub async fn process_sse(
                 response_error = Some(error.into_api_error());
             }
         };
+        if made_response_progress {
+            next_response_event_deadline = Instant::now() + idle_timeout;
+        }
     }
 }
 
@@ -868,6 +884,38 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn process_sse_idle_timeout_ignores_unforwarded_response_events() {
+        let stream = stream::unfold((), |_| async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Some((
+                Ok(Bytes::from(
+                    "event: response.in_progress\ndata: {\"type\":\"response.in_progress\"}\n\n",
+                )),
+                (),
+            ))
+        });
+        let stream: ByteStream = Box::pin(stream);
+        let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(8);
+
+        tokio::spawn(process_sse(
+            stream,
+            tx,
+            Duration::from_millis(50),
+            /*telemetry*/ None,
+        ));
+
+        let result = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("semantic idle timeout should fire before test timeout")
+            .expect("process_sse should send a terminal error");
+
+        assert_matches!(
+            result,
+            Err(ApiError::Stream(message)) if message == "idle timeout waiting for SSE"
+        );
     }
 
     #[tokio::test]
