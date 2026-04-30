@@ -571,11 +571,20 @@ async fn run_websocket_response_stream(
 
     result?;
 
+    let mut next_response_event_deadline = Instant::now() + idle_timeout;
     loop {
         let poll_start = Instant::now();
-        let response = tokio::time::timeout(idle_timeout, ws_stream.next())
+        let remaining = next_response_event_deadline.saturating_duration_since(poll_start);
+        if remaining.is_zero() {
+            return Err(ApiError::Stream(
+                "idle timeout waiting for websocket response event".into(),
+            ));
+        }
+        let response = tokio::time::timeout(remaining, ws_stream.next())
             .await
-            .map_err(|_| ApiError::Stream("idle timeout waiting for websocket".into()));
+            .map_err(|_| {
+                ApiError::Stream("idle timeout waiting for websocket response event".into())
+            });
         if let Some(t) = telemetry.as_ref() {
             t.on_ws_event(&response, poll_start.elapsed());
         }
@@ -611,6 +620,7 @@ async fn run_websocket_response_stream(
                         continue;
                     }
                 };
+                next_response_event_deadline = Instant::now() + idle_timeout;
                 let model_verifications = event.model_verifications();
                 if event.kind() == "codex.rate_limits" {
                     if let Some(snapshot) = parse_rate_limit_event(&text) {
@@ -671,11 +681,72 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+    use tokio::time::sleep;
+    use tokio::time::timeout;
+
+    fn fake_ws_stream() -> (WsStream, mpsc::UnboundedSender<Result<Message, WsError>>) {
+        let (tx_command, mut rx_command) = mpsc::channel::<WsCommand>(32);
+        let (tx_message, rx_message) = mpsc::unbounded_channel::<Result<Message, WsError>>();
+        let pump_task = tokio::spawn(async move {
+            while let Some(command) = rx_command.recv().await {
+                match command {
+                    WsCommand::Send { tx_result, .. } => {
+                        let _ = tx_result.send(Ok(()));
+                    }
+                }
+            }
+        });
+        (
+            WsStream {
+                tx_command,
+                rx_message,
+                pump_task,
+            },
+            tx_message,
+        )
+    }
 
     #[test]
     fn websocket_config_enables_permessage_deflate() {
         let config = websocket_config();
         assert!(config.extensions.permessage_deflate.is_some());
+    }
+
+    #[tokio::test]
+    async fn websocket_idle_timeout_ignores_transport_keepalive_messages() {
+        let (mut ws_stream, tx_message) = fake_ws_stream();
+        let (tx_event, _rx_event) = mpsc::channel(8);
+        let keepalive_task = tokio::spawn(async move {
+            loop {
+                if tx_message
+                    .send(Ok(Message::Pong(Vec::new().into())))
+                    .is_err()
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        let result = timeout(
+            Duration::from_millis(500),
+            run_websocket_response_stream(
+                &mut ws_stream,
+                tx_event,
+                json!({ "type": "response.create" }),
+                Duration::from_millis(50),
+                None,
+                false,
+            ),
+        )
+        .await
+        .expect("semantic idle timeout should fire before test timeout");
+
+        keepalive_task.abort();
+        let Err(ApiError::Stream(message)) = result else {
+            panic!("expected websocket stream idle error");
+        };
+        assert_eq!(message, "idle timeout waiting for websocket response event");
     }
 
     #[test]
