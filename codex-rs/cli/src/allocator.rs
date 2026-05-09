@@ -164,7 +164,7 @@ fn allocator_role_for_subcommand(subcommand: &Option<Subcommand>) -> Option<&'st
         Some(Subcommand::Resume(_)) => Some("resume"),
         Some(Subcommand::Fork(_)) => Some("fork"),
         Some(Subcommand::Cloud(_)) => Some("cloud"),
-        Some(Subcommand::Responses(_)) => Some("responses"),
+        Some(Subcommand::ResponsesApiProxy(_)) => Some("responses-api-proxy"),
         _ => None,
     }
 }
