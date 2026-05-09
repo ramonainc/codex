@@ -490,7 +490,7 @@ async fn collect_login_status_payload(
     options: LoginStatusOptions,
 ) -> Result<LoginStatusPayload, String> {
     let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false);
+        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
     let mut refresh_status = default_refresh_status(options.refresh);
     if options.refresh {
         if let Err(err) = auth_manager.refresh_token().await {
