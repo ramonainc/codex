@@ -110,7 +110,6 @@ mod tests {
 
         let policy = SandboxPolicy::WorkspaceWrite {
             writable_roots: vec![AbsolutePathBuf::try_from(extra_root.as_path()).unwrap()],
-            read_only_access: Default::default(),
             network_access: false,
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
@@ -118,12 +117,16 @@ mod tests {
 
         let paths = compute_allow_paths(&policy, &command_cwd, &command_cwd, &HashMap::new());
 
-        assert!(paths
-            .allow
-            .contains(&dunce::canonicalize(&command_cwd).unwrap()));
-        assert!(paths
-            .allow
-            .contains(&dunce::canonicalize(&extra_root).unwrap()));
+        assert!(
+            paths
+                .allow
+                .contains(&dunce::canonicalize(&command_cwd).unwrap())
+        );
+        assert!(
+            paths
+                .allow
+                .contains(&dunce::canonicalize(&extra_root).unwrap())
+        );
         assert!(paths.deny.is_empty(), "no deny paths expected");
     }
 
@@ -137,7 +140,6 @@ mod tests {
 
         let policy = SandboxPolicy::WorkspaceWrite {
             writable_roots: vec![],
-            read_only_access: Default::default(),
             network_access: false,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: false,
@@ -147,12 +149,16 @@ mod tests {
 
         let paths = compute_allow_paths(&policy, &command_cwd, &command_cwd, &env_map);
 
-        assert!(paths
-            .allow
-            .contains(&dunce::canonicalize(&command_cwd).unwrap()));
-        assert!(!paths
-            .allow
-            .contains(&dunce::canonicalize(&temp_dir).unwrap()));
+        assert!(
+            paths
+                .allow
+                .contains(&dunce::canonicalize(&command_cwd).unwrap())
+        );
+        assert!(
+            !paths
+                .allow
+                .contains(&dunce::canonicalize(&temp_dir).unwrap())
+        );
         assert!(paths.deny.is_empty(), "no deny paths expected");
     }
 
@@ -165,7 +171,6 @@ mod tests {
 
         let policy = SandboxPolicy::WorkspaceWrite {
             writable_roots: vec![],
-            read_only_access: Default::default(),
             network_access: false,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: false,
@@ -193,7 +198,6 @@ mod tests {
 
         let policy = SandboxPolicy::WorkspaceWrite {
             writable_roots: vec![],
-            read_only_access: Default::default(),
             network_access: false,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: false,
@@ -222,7 +226,6 @@ mod tests {
 
         let policy = SandboxPolicy::WorkspaceWrite {
             writable_roots: vec![],
-            read_only_access: Default::default(),
             network_access: false,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: false,
@@ -251,7 +254,6 @@ mod tests {
 
         let policy = SandboxPolicy::WorkspaceWrite {
             writable_roots: vec![],
-            read_only_access: Default::default(),
             network_access: false,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: false,
@@ -259,6 +261,9 @@ mod tests {
 
         let paths = compute_allow_paths(&policy, &command_cwd, &command_cwd, &HashMap::new());
         assert_eq!(paths.allow.len(), 1);
-        assert!(paths.deny.is_empty(), "no deny when protected dirs are absent");
+        assert!(
+            paths.deny.is_empty(),
+            "no deny when protected dirs are absent"
+        );
     }
 }

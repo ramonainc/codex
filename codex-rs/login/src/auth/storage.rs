@@ -19,11 +19,16 @@ use std::sync::Mutex;
 use tracing::warn;
 
 use crate::token_data::TokenData;
+use codex_agent_identity::AgentIdentityJwtClaims;
+use codex_agent_identity::decode_agent_identity_jwt;
 use codex_app_server_protocol::AuthMode;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_keyring_store::DefaultKeyringStore;
 use codex_keyring_store::KeyringStore;
+use codex_protocol::account::PlanType as AccountPlanType;
 use once_cell::sync::Lazy;
+
+const CODEX_AUTH_FILE_ENV: &str = "CODEX_AUTH_FILE";
 
 /// Expected structure for $CODEX_HOME/auth.json.
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
@@ -39,10 +44,54 @@ pub struct AuthDotJson {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_refresh: Option<DateTime<Utc>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_identity: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct AgentIdentityAuthRecord {
+    pub agent_runtime_id: String,
+    pub agent_private_key: String,
+    pub account_id: String,
+    pub chatgpt_user_id: String,
+    pub email: String,
+    pub plan_type: AccountPlanType,
+    pub chatgpt_account_is_fedramp: bool,
+}
+
+impl AgentIdentityAuthRecord {
+    pub(crate) fn from_agent_identity_jwt(jwt: &str) -> std::io::Result<Self> {
+        let claims =
+            decode_agent_identity_jwt(jwt, /*jwks*/ None).map_err(std::io::Error::other)?;
+
+        Ok(claims.into())
+    }
+}
+
+impl From<AgentIdentityJwtClaims> for AgentIdentityAuthRecord {
+    fn from(claims: AgentIdentityJwtClaims) -> Self {
+        Self {
+            agent_runtime_id: claims.agent_runtime_id,
+            agent_private_key: claims.agent_private_key,
+            account_id: claims.account_id,
+            chatgpt_user_id: claims.chatgpt_user_id,
+            email: claims.email,
+            plan_type: claims.plan_type.into(),
+            chatgpt_account_is_fedramp: claims.chatgpt_account_is_fedramp,
+        }
+    }
 }
 
 pub(super) fn get_auth_file(codex_home: &Path) -> PathBuf {
-    codex_home.join("auth.json")
+    get_auth_file_from_env(codex_home, std::env::var_os(CODEX_AUTH_FILE_ENV))
+}
+
+fn get_auth_file_from_env(codex_home: &Path, auth_file_env: Option<std::ffi::OsString>) -> PathBuf {
+    match auth_file_env {
+        Some(value) if !value.is_empty() => PathBuf::from(value),
+        _ => codex_home.join("auth.json"),
+    }
 }
 
 pub(super) fn delete_file_if_exists(codex_home: &Path) -> std::io::Result<bool> {

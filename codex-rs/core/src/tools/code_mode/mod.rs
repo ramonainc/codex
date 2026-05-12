@@ -1,12 +1,13 @@
 mod execute_handler;
+pub(crate) mod execute_spec;
 mod response_adapter;
 mod wait_handler;
+pub(crate) mod wait_spec;
 
-use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use codex_code_mode::CodeModeNestedToolCall;
 use codex_code_mode::CodeModeTurnHost;
 use codex_code_mode::RuntimeResponse;
 use codex_protocol::models::FunctionCallOutputContentItem;
@@ -45,6 +46,11 @@ pub(crate) const PUBLIC_TOOL_NAME: &str = codex_code_mode::PUBLIC_TOOL_NAME;
 pub(crate) const WAIT_TOOL_NAME: &str = codex_code_mode::WAIT_TOOL_NAME;
 pub(crate) const DEFAULT_WAIT_YIELD_TIME_MS: u64 = codex_code_mode::DEFAULT_WAIT_YIELD_TIME_MS;
 
+/// Returns true for the un-namespaced code-mode `exec` tool.
+pub(crate) fn is_exec_tool_name(tool_name: &ToolName) -> bool {
+    tool_name.namespace.is_none() && tool_name.name == PUBLIC_TOOL_NAME
+}
+
 #[derive(Clone)]
 pub(crate) struct ExecContext {
     pub(super) session: Arc<Session>,
@@ -56,7 +62,7 @@ pub(crate) struct CodeModeService {
 }
 
 impl CodeModeService {
-    pub(crate) fn new(_js_repl_node_path: Option<PathBuf>) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: codex_code_mode::CodeModeService::new(),
         }
@@ -73,6 +79,10 @@ impl CodeModeService {
         self.inner.replace_stored_values(values).await;
     }
 
+    pub(crate) fn allocate_cell_id(&self) -> String {
+        self.inner.allocate_cell_id()
+    }
+
     pub(crate) async fn execute(
         &self,
         request: codex_code_mode::ExecuteRequest,
@@ -83,7 +93,7 @@ impl CodeModeService {
     pub(crate) async fn wait(
         &self,
         request: codex_code_mode::WaitRequest,
-    ) -> Result<RuntimeResponse, String> {
+    ) -> Result<codex_code_mode::WaitOutcome, String> {
         self.inner.wait(request).await
     }
 
@@ -118,15 +128,13 @@ struct CoreTurnHost {
 impl CodeModeTurnHost for CoreTurnHost {
     async fn invoke_tool(
         &self,
-        tool_name: ToolName,
-        input: Option<JsonValue>,
+        invocation: CodeModeNestedToolCall,
         cancellation_token: CancellationToken,
     ) -> Result<JsonValue, String> {
         call_nested_tool(
             self.exec.clone(),
             self.tool_runtime.clone(),
-            tool_name,
-            input,
+            invocation,
             cancellation_token,
         )
         .await
@@ -265,26 +273,9 @@ pub(super) async fn build_enabled_tools(
 )]
 async fn build_nested_router(exec: &ExecContext) -> ToolRouter {
     let nested_tools_config = exec.turn.tools_config.for_code_mode_nested_tools();
-    let listed_mcp_tools = exec
-        .session
-        .services
-        .mcp_connection_manager
-        .read()
-        .await
-        .list_all_tools()
-        .await;
-    let parallel_mcp_server_names = exec
-        .turn
-        .config
-        .mcp_servers
-        .get()
-        .iter()
-        .filter_map(|(server_name, server_config)| {
-            server_config
-                .supports_parallel_tool_calls
-                .then_some(server_name.clone())
-        })
-        .collect::<HashSet<_>>();
+    let mcp_connection_manager = exec.session.services.mcp_connection_manager.read().await;
+    let listed_mcp_tools = mcp_connection_manager.list_all_tools().await;
+    let parallel_mcp_server_names = mcp_connection_manager.parallel_tool_call_server_names();
 
     ToolRouter::from_config(
         &nested_tools_config,
@@ -302,11 +293,16 @@ async fn build_nested_router(exec: &ExecContext) -> ToolRouter {
 async fn call_nested_tool(
     exec: ExecContext,
     tool_runtime: ToolCallRuntime,
-    tool_name: ToolName,
-    input: Option<JsonValue>,
+    invocation: CodeModeNestedToolCall,
     cancellation_token: CancellationToken,
 ) -> Result<JsonValue, FunctionCallError> {
-    if tool_name.namespace.is_none() && tool_name.name == PUBLIC_TOOL_NAME {
+    let CodeModeNestedToolCall {
+        cell_id,
+        runtime_tool_call_id,
+        tool_name,
+        input,
+    } = invocation;
+    if is_exec_tool_name(&tool_name) {
         return Err(FunctionCallError::RespondToModel(format!(
             "{PUBLIC_TOOL_NAME} cannot invoke itself"
         )));
@@ -339,7 +335,14 @@ async fn call_nested_tool(
         payload,
     };
     let result = tool_runtime
-        .handle_tool_call_with_source(call, ToolCallSource::CodeMode, cancellation_token)
+        .handle_tool_call_with_source(
+            call,
+            ToolCallSource::CodeMode {
+                cell_id,
+                runtime_tool_call_id,
+            },
+            cancellation_token,
+        )
         .await?;
     Ok(result.code_mode_result())
 }

@@ -1,6 +1,6 @@
-use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::anyhow;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
@@ -8,11 +8,13 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::time::UNIX_EPOCH;
 use tempfile::NamedTempFile;
 
 use crate::logging::log_note;
 use crate::sandbox_bin_dir;
 
+const DEV_BUILD_VERSION_SENTINEL: &str = "0.0.0";
 const RESOURCES_DIRNAME: &str = "codex-resources";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -87,10 +89,7 @@ pub(crate) fn resolve_helper_for_launch(
     }
 }
 
-pub fn resolve_current_exe_for_launch(
-    codex_home: &Path,
-    fallback_executable: &str,
-) -> PathBuf {
+pub fn resolve_current_exe_for_launch(codex_home: &Path, fallback_executable: &str) -> PathBuf {
     let source = match std::env::current_exe() {
         Ok(path) => path,
         Err(_) => return PathBuf::from(fallback_executable),
@@ -134,7 +133,7 @@ pub(crate) fn copy_helper_if_needed(
     }
 
     let source = sibling_source_path(kind)?;
-    let destination = helper_bin_dir(codex_home).join(kind.file_name());
+    let destination = helper_destination_for_source(kind, codex_home, &source)?;
     log_note(
         &format!(
             "helper copy: validating {} source={} destination={}",
@@ -197,14 +196,63 @@ fn source_path_for_exe(exe: &Path, file_name: &str) -> Option<PathBuf> {
     resource_candidate.exists().then_some(resource_candidate)
 }
 
+fn helper_destination_for_source(
+    kind: HelperExecutable,
+    codex_home: &Path,
+    source: &Path,
+) -> Result<PathBuf> {
+    let suffix = helper_version_suffix(source)?;
+    let file_name = materialized_file_name(kind, &suffix);
+    Ok(helper_bin_dir(codex_home).join(file_name))
+}
+
+fn materialized_file_name(kind: HelperExecutable, suffix: &str) -> String {
+    let source_name = kind.file_name();
+    let path = Path::new(source_name);
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(source_name);
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| format!(".{ext}"))
+        .unwrap_or_default();
+    format!("{stem}-{suffix}{extension}")
+}
+
+fn helper_version_suffix(source: &Path) -> Result<String> {
+    let version = env!("CARGO_PKG_VERSION");
+    if version == DEV_BUILD_VERSION_SENTINEL {
+        dev_build_suffix(source)
+    } else {
+        Ok(version.to_string())
+    }
+}
+
+fn dev_build_suffix(source: &Path) -> Result<String> {
+    let metadata = fs::metadata(source)
+        .with_context(|| format!("read helper source metadata {}", source.display()))?;
+    let modified = metadata
+        .modified()
+        .with_context(|| format!("read helper source mtime {}", source.display()))?;
+    let duration = modified
+        .duration_since(UNIX_EPOCH)
+        .with_context(|| format!("convert helper source mtime {}", source.display()))?;
+    Ok(format!("{}-{:x}", metadata.len(), duration.as_secs(),))
+}
+
 fn copy_from_source_if_needed(source: &Path, destination: &Path) -> Result<CopyOutcome> {
     if destination_is_fresh(source, destination)? {
         return Ok(CopyOutcome::Reused);
     }
 
-    let destination_dir = destination
-        .parent()
-        .ok_or_else(|| anyhow!("helper destination has no parent: {}", destination.display()))?;
+    let destination_dir = destination.parent().ok_or_else(|| {
+        anyhow!(
+            "helper destination has no parent: {}",
+            destination.display()
+        )
+    })?;
     fs::create_dir_all(destination_dir).with_context(|| {
         format!(
             "create helper destination directory {}",
@@ -275,8 +323,9 @@ fn destination_is_fresh(source: &Path, destination: &Path) -> Result<bool> {
         Ok(meta) => meta,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(err) => {
-            return Err(err)
-                .with_context(|| format!("read helper destination metadata {}", destination.display()));
+            return Err(err).with_context(|| {
+                format!("read helper destination metadata {}", destination.display())
+            });
         }
     };
 
@@ -296,11 +345,16 @@ fn destination_is_fresh(source: &Path, destination: &Path) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::copy_from_source_if_needed;
     use super::CopyOutcome;
-    use super::destination_is_fresh;
-    use super::helper_bin_dir;
+    use super::DEV_BUILD_VERSION_SENTINEL;
+    use super::HelperExecutable;
     use super::RESOURCES_DIRNAME;
+    use super::copy_from_source_if_needed;
+    use super::destination_is_fresh;
+    use super::dev_build_suffix;
+    use super::helper_bin_dir;
+    use super::helper_version_suffix;
+    use super::materialized_file_name;
     use super::source_path_for_exe;
     use pretty_assertions::assert_eq;
     use std::fs;
@@ -319,7 +373,10 @@ mod tests {
         let outcome = copy_from_source_if_needed(&source, &destination).expect("copy helper");
 
         assert_eq!(CopyOutcome::ReCopied, outcome);
-        assert_eq!(b"runner-v1".as_slice(), fs::read(&destination).expect("read destination"));
+        assert_eq!(
+            b"runner-v1".as_slice(),
+            fs::read(&destination).expect("read destination")
+        );
     }
 
     #[test]
@@ -346,11 +403,13 @@ mod tests {
         fs::write(&source, b"runner-v1").expect("write source");
         copy_from_source_if_needed(&source, &destination).expect("initial copy");
 
-        let outcome =
-            copy_from_source_if_needed(&source, &destination).expect("revalidate helper");
+        let outcome = copy_from_source_if_needed(&source, &destination).expect("revalidate helper");
 
         assert_eq!(CopyOutcome::Reused, outcome);
-        assert_eq!(b"runner-v1".as_slice(), fs::read(&destination).expect("read destination"));
+        assert_eq!(
+            b"runner-v1".as_slice(),
+            fs::read(&destination).expect("read destination")
+        );
     }
 
     #[test]
@@ -370,8 +429,12 @@ mod tests {
         let source_dir = tmp.path().join("sibling-source");
         fs::create_dir_all(&source_dir).expect("create source dir");
         let runner_source = source_dir.join("codex-command-runner.exe");
-        let runner_destination = helper_bin_dir(&codex_home).join("codex-command-runner.exe");
         fs::write(&runner_source, b"runner").expect("runner");
+        let runner_suffix = helper_version_suffix(&runner_source).expect("runner suffix");
+        let runner_destination = helper_bin_dir(&codex_home).join(materialized_file_name(
+            HelperExecutable::CommandRunner,
+            &runner_suffix,
+        ));
 
         let runner_outcome =
             copy_from_source_if_needed(&runner_source, &runner_destination).expect("runner copy");
@@ -394,8 +457,8 @@ mod tests {
         fs::write(&exe, b"codex").expect("write exe");
         fs::write(&helper, b"runner").expect("write helper");
 
-        let resolved =
-            source_path_for_exe(&exe, /*file_name*/ "codex-command-runner.exe").expect("helper path");
+        let resolved = source_path_for_exe(&exe, /*file_name*/ "codex-command-runner.exe")
+            .expect("helper path");
 
         assert_eq!(resolved, helper);
     }
@@ -413,9 +476,30 @@ mod tests {
         fs::write(&sibling_helper, b"sibling runner").expect("write sibling helper");
         fs::write(&resource_helper, b"resource runner").expect("write resource helper");
 
-        let resolved =
-            source_path_for_exe(&exe, /*file_name*/ "codex-command-runner.exe").expect("helper path");
+        let resolved = source_path_for_exe(&exe, /*file_name*/ "codex-command-runner.exe")
+            .expect("helper path");
 
         assert_eq!(resolved, sibling_helper);
+    }
+
+    #[test]
+    fn helper_version_suffix_uses_cli_version_or_dev_build_metadata() {
+        let tmp = TempDir::new().expect("tempdir");
+        let source = tmp.path().join("source.exe");
+        fs::write(&source, b"runner-v1").expect("write source");
+        let suffix = helper_version_suffix(&source).expect("suffix");
+
+        if env!("CARGO_PKG_VERSION") == DEV_BUILD_VERSION_SENTINEL {
+            assert_eq!(suffix, dev_build_suffix(&source).expect("dev build suffix"));
+        } else {
+            assert_eq!(suffix, env!("CARGO_PKG_VERSION"));
+        }
+    }
+
+    #[test]
+    fn materialized_file_name_adds_suffix_before_extension() {
+        let file_name = materialized_file_name(HelperExecutable::CommandRunner, "test-suffix");
+
+        assert_eq!(file_name, "codex-command-runner-test-suffix.exe");
     }
 }

@@ -44,6 +44,8 @@ use crate::exec_events::PatchChangeKind as ExecPatchChangeKind;
 use crate::exec_events::ReasoningItem;
 use crate::exec_events::ThreadErrorEvent;
 use crate::exec_events::ThreadEvent;
+use crate::exec_events::ThreadGoalEvent;
+use crate::exec_events::ThreadGoalUpdatedEvent;
 use crate::exec_events::ThreadItem as ExecThreadItem;
 use crate::exec_events::ThreadItemDetails;
 use crate::exec_events::ThreadStartedEvent;
@@ -122,6 +124,7 @@ impl EventProcessorWithJsonOutput {
             input_tokens: usage.total.input_tokens,
             cached_input_tokens: usage.total.cached_input_tokens,
             output_tokens: usage.total.output_tokens,
+            reasoning_output_tokens: usage.total.reasoning_output_tokens,
         }
     }
 
@@ -391,7 +394,7 @@ impl EventProcessorWithJsonOutput {
 
     pub fn thread_started_event(session_configured: &SessionConfiguredEvent) -> ThreadEvent {
         ThreadEvent::ThreadStarted(ThreadStartedEvent {
-            thread_id: session_configured.session_id.to_string(),
+            thread_id: session_configured.thread_id.to_string(),
         })
     }
 
@@ -489,8 +492,22 @@ impl EventProcessorWithJsonOutput {
                 }));
                 CodexStatus::Running
             }
+            ServerNotification::ModelVerification(_) => CodexStatus::Running,
             ServerNotification::ThreadTokenUsageUpdated(notification) => {
                 self.last_total_token_usage = Some(notification.token_usage);
+                CodexStatus::Running
+            }
+            ServerNotification::ThreadGoalUpdated(notification) => {
+                events.push(ThreadEvent::ThreadGoalUpdated(ThreadGoalUpdatedEvent {
+                    goal: ThreadGoalEvent {
+                        thread_id: notification.goal.thread_id,
+                        objective: notification.goal.objective,
+                        status: format!("{:?}", notification.goal.status).to_lowercase(),
+                        token_budget: notification.goal.token_budget,
+                        tokens_used: notification.goal.tokens_used,
+                        time_used_seconds: notification.goal.time_used_seconds,
+                    },
+                }));
                 CodexStatus::Running
             }
             ServerNotification::TurnCompleted(notification) => {

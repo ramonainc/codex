@@ -142,7 +142,9 @@ async fn auth_manager_logout_with_revoke_uses_cached_auth() -> Result<()> {
         codex_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    );
+        /*chatgpt_base_url*/ None,
+    )
+    .await;
     save_auth(
         codex_home.path(),
         &chatgpt_auth_with_refresh_token("newer-disk-refresh-token"),
@@ -192,6 +194,7 @@ fn chatgpt_auth_with_refresh_token(refresh_token: &str) -> AuthDotJson {
             account_id: Some("account-id".to_string()),
         }),
         last_refresh: None,
+        agent_identity: None,
     }
 }
 

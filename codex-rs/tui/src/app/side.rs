@@ -92,6 +92,7 @@ impl SideParentStatus {
             | ServerRequest::ApplyPatchApproval { .. }
             | ServerRequest::ExecCommandApproval { .. } => Some(SideParentStatus::NeedsApproval),
             ServerRequest::DynamicToolCall { .. }
+            | ServerRequest::AttestationGenerate { .. }
             | ServerRequest::ChatgptAuthTokensRefresh { .. } => None,
         }
     }
@@ -440,7 +441,6 @@ impl App {
             content: vec![ContentItem::InputText {
                 text: SIDE_BOUNDARY_PROMPT.to_string(),
             }],
-            end_turn: None,
             phase: None,
         }
     }

@@ -46,7 +46,7 @@ async fn refresh_token_succeeds_updates_storage() -> Result<()> {
         .mount(&server)
         .await;
 
-    let ctx = RefreshTokenTestContext::new(&server)?;
+    let ctx = RefreshTokenTestContext::new(&server).await?;
     let initial_last_refresh = Utc::now() - Duration::days(1);
     let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
     let initial_auth = AuthDotJson {
@@ -54,8 +54,9 @@ async fn refresh_token_succeeds_updates_storage() -> Result<()> {
         openai_api_key: None,
         tokens: Some(initial_tokens.clone()),
         last_refresh: Some(initial_last_refresh),
+        agent_identity: None,
     };
-    ctx.write_auth(&initial_auth)?;
+    ctx.write_auth(&initial_auth).await?;
 
     ctx.auth_manager
         .refresh_token_from_authority()
@@ -109,7 +110,7 @@ async fn refresh_token_refreshes_when_auth_is_unchanged() -> Result<()> {
         .mount(&server)
         .await;
 
-    let ctx = RefreshTokenTestContext::new(&server)?;
+    let ctx = RefreshTokenTestContext::new(&server).await?;
     let initial_last_refresh = Utc::now() - Duration::days(1);
     let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
     let initial_auth = AuthDotJson {
@@ -117,8 +118,9 @@ async fn refresh_token_refreshes_when_auth_is_unchanged() -> Result<()> {
         openai_api_key: None,
         tokens: Some(initial_tokens.clone()),
         last_refresh: Some(initial_last_refresh),
+        agent_identity: None,
     };
-    ctx.write_auth(&initial_auth)?;
+    ctx.write_auth(&initial_auth).await?;
 
     ctx.auth_manager
         .refresh_token()
@@ -162,7 +164,7 @@ async fn refresh_token_skips_refresh_when_auth_changed() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = MockServer::start().await;
-    let ctx = RefreshTokenTestContext::new(&server)?;
+    let ctx = RefreshTokenTestContext::new(&server).await?;
 
     let initial_last_refresh = Utc::now() - Duration::days(1);
     let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
@@ -171,8 +173,9 @@ async fn refresh_token_skips_refresh_when_auth_changed() -> Result<()> {
         openai_api_key: None,
         tokens: Some(initial_tokens),
         last_refresh: Some(initial_last_refresh),
+        agent_identity: None,
     };
-    ctx.write_auth(&initial_auth)?;
+    ctx.write_auth(&initial_auth).await?;
 
     let disk_tokens = build_tokens("disk-access-token", "disk-refresh-token");
     let disk_auth = AuthDotJson {
@@ -180,6 +183,7 @@ async fn refresh_token_skips_refresh_when_auth_changed() -> Result<()> {
         openai_api_key: None,
         tokens: Some(disk_tokens.clone()),
         last_refresh: Some(initial_last_refresh),
+        agent_identity: None,
     };
     save_auth(
         ctx.codex_home.path(),
@@ -226,7 +230,7 @@ async fn refresh_token_errors_on_account_mismatch() -> Result<()> {
         .mount(&server)
         .await;
 
-    let ctx = RefreshTokenTestContext::new(&server)?;
+    let ctx = RefreshTokenTestContext::new(&server).await?;
     let initial_last_refresh = Utc::now() - Duration::days(1);
     let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
     let initial_auth = AuthDotJson {
@@ -234,8 +238,9 @@ async fn refresh_token_errors_on_account_mismatch() -> Result<()> {
         openai_api_key: None,
         tokens: Some(initial_tokens.clone()),
         last_refresh: Some(initial_last_refresh),
+        agent_identity: None,
     };
-    ctx.write_auth(&initial_auth)?;
+    ctx.write_auth(&initial_auth).await?;
 
     let mut disk_tokens = build_tokens("disk-access-token", "disk-refresh-token");
     disk_tokens.account_id = Some("other-account".to_string());
@@ -244,6 +249,7 @@ async fn refresh_token_errors_on_account_mismatch() -> Result<()> {
         openai_api_key: None,
         tokens: Some(disk_tokens),
         last_refresh: Some(initial_last_refresh),
+        agent_identity: None,
     };
     save_auth(
         ctx.codex_home.path(),
@@ -293,7 +299,7 @@ async fn returns_fresh_tokens_as_is() -> Result<()> {
         .mount(&server)
         .await;
 
-    let ctx = RefreshTokenTestContext::new(&server)?;
+    let ctx = RefreshTokenTestContext::new(&server).await?;
     let stale_refresh = Utc::now() - Duration::days(9);
     let fresh_access_token = access_token_with_expiration(Utc::now() + Duration::hours(1));
     let initial_tokens = build_tokens(&fresh_access_token, INITIAL_REFRESH_TOKEN);
@@ -302,8 +308,9 @@ async fn returns_fresh_tokens_as_is() -> Result<()> {
         openai_api_key: None,
         tokens: Some(initial_tokens.clone()),
         last_refresh: Some(stale_refresh),
+        agent_identity: None,
     };
-    ctx.write_auth(&initial_auth)?;
+    ctx.write_auth(&initial_auth).await?;
 
     let cached_auth = ctx
         .auth_manager
@@ -340,7 +347,7 @@ async fn refreshes_token_when_access_token_is_expired() -> Result<()> {
         .mount(&server)
         .await;
 
-    let ctx = RefreshTokenTestContext::new(&server)?;
+    let ctx = RefreshTokenTestContext::new(&server).await?;
     let fresh_refresh = Utc::now() - Duration::days(1);
     let expired_access_token = access_token_with_expiration(Utc::now() - Duration::hours(1));
     let initial_tokens = build_tokens(&expired_access_token, INITIAL_REFRESH_TOKEN);
@@ -349,8 +356,9 @@ async fn refreshes_token_when_access_token_is_expired() -> Result<()> {
         openai_api_key: None,
         tokens: Some(initial_tokens.clone()),
         last_refresh: Some(fresh_refresh),
+        agent_identity: None,
     };
-    ctx.write_auth(&initial_auth)?;
+    ctx.write_auth(&initial_auth).await?;
 
     let cached_auth = ctx
         .auth_manager
@@ -390,7 +398,7 @@ async fn auth_reloads_disk_auth_when_cached_auth_is_stale() -> Result<()> {
 
     let server = MockServer::start().await;
 
-    let ctx = RefreshTokenTestContext::new(&server)?;
+    let ctx = RefreshTokenTestContext::new(&server).await?;
     let stale_refresh = Utc::now() - Duration::days(9);
     let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
     let initial_auth = AuthDotJson {
@@ -398,8 +406,9 @@ async fn auth_reloads_disk_auth_when_cached_auth_is_stale() -> Result<()> {
         openai_api_key: None,
         tokens: Some(initial_tokens),
         last_refresh: Some(stale_refresh),
+        agent_identity: None,
     };
-    ctx.write_auth(&initial_auth)?;
+    ctx.write_auth(&initial_auth).await?;
 
     let fresh_refresh = Utc::now() - Duration::days(1);
     let disk_tokens = build_tokens("disk-access-token", "disk-refresh-token");
@@ -408,6 +417,7 @@ async fn auth_reloads_disk_auth_when_cached_auth_is_stale() -> Result<()> {
         openai_api_key: None,
         tokens: Some(disk_tokens.clone()),
         last_refresh: Some(fresh_refresh),
+        agent_identity: None,
     };
     save_auth(
         ctx.codex_home.path(),
@@ -451,7 +461,7 @@ async fn auth_reloads_disk_auth_without_calling_expired_refresh_token() -> Resul
         .mount(&server)
         .await;
 
-    let ctx = RefreshTokenTestContext::new(&server)?;
+    let ctx = RefreshTokenTestContext::new(&server).await?;
     let stale_refresh = Utc::now() - Duration::days(9);
     let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
     let initial_auth = AuthDotJson {
@@ -459,8 +469,9 @@ async fn auth_reloads_disk_auth_without_calling_expired_refresh_token() -> Resul
         openai_api_key: None,
         tokens: Some(initial_tokens),
         last_refresh: Some(stale_refresh),
+        agent_identity: None,
     };
-    ctx.write_auth(&initial_auth)?;
+    ctx.write_auth(&initial_auth).await?;
 
     let fresh_refresh = Utc::now() - Duration::days(1);
     let disk_tokens = build_tokens("disk-access-token", "disk-refresh-token");
@@ -469,6 +480,7 @@ async fn auth_reloads_disk_auth_without_calling_expired_refresh_token() -> Resul
         openai_api_key: None,
         tokens: Some(disk_tokens.clone()),
         last_refresh: Some(fresh_refresh),
+        agent_identity: None,
     };
     save_auth(
         ctx.codex_home.path(),
@@ -510,7 +522,7 @@ async fn refresh_token_returns_permanent_error_for_expired_refresh_token() -> Re
         .mount(&server)
         .await;
 
-    let ctx = RefreshTokenTestContext::new(&server)?;
+    let ctx = RefreshTokenTestContext::new(&server).await?;
     let initial_last_refresh = Utc::now() - Duration::days(1);
     let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
     let initial_auth = AuthDotJson {
@@ -518,8 +530,9 @@ async fn refresh_token_returns_permanent_error_for_expired_refresh_token() -> Re
         openai_api_key: None,
         tokens: Some(initial_tokens.clone()),
         last_refresh: Some(initial_last_refresh),
+        agent_identity: None,
     };
-    ctx.write_auth(&initial_auth)?;
+    ctx.write_auth(&initial_auth).await?;
 
     let err = ctx
         .auth_manager
@@ -562,7 +575,7 @@ async fn refresh_token_does_not_retry_after_permanent_failure() -> Result<()> {
         .mount(&server)
         .await;
 
-    let ctx = RefreshTokenTestContext::new(&server)?;
+    let ctx = RefreshTokenTestContext::new(&server).await?;
     let initial_last_refresh = Utc::now() - Duration::days(1);
     let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
     let initial_auth = AuthDotJson {
@@ -570,8 +583,9 @@ async fn refresh_token_does_not_retry_after_permanent_failure() -> Result<()> {
         openai_api_key: None,
         tokens: Some(initial_tokens.clone()),
         last_refresh: Some(initial_last_refresh),
+        agent_identity: None,
     };
-    ctx.write_auth(&initial_auth)?;
+    ctx.write_auth(&initial_auth).await?;
 
     let first_err = ctx
         .auth_manager
@@ -628,7 +642,7 @@ async fn refresh_token_reloads_changed_auth_after_permanent_failure() -> Result<
         .mount(&server)
         .await;
 
-    let ctx = RefreshTokenTestContext::new(&server)?;
+    let ctx = RefreshTokenTestContext::new(&server).await?;
     let initial_last_refresh = Utc::now() - Duration::days(1);
     let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
     let initial_auth = AuthDotJson {
@@ -636,8 +650,9 @@ async fn refresh_token_reloads_changed_auth_after_permanent_failure() -> Result<
         openai_api_key: None,
         tokens: Some(initial_tokens.clone()),
         last_refresh: Some(initial_last_refresh),
+        agent_identity: None,
     };
-    ctx.write_auth(&initial_auth)?;
+    ctx.write_auth(&initial_auth).await?;
 
     let first_err = ctx
         .auth_manager
@@ -657,6 +672,7 @@ async fn refresh_token_reloads_changed_auth_after_permanent_failure() -> Result<
         openai_api_key: None,
         tokens: Some(disk_tokens.clone()),
         last_refresh: Some(fresh_refresh),
+        agent_identity: None,
     };
     save_auth(
         ctx.codex_home.path(),
@@ -707,7 +723,7 @@ async fn refresh_token_returns_transient_error_on_server_failure() -> Result<()>
         .mount(&server)
         .await;
 
-    let ctx = RefreshTokenTestContext::new(&server)?;
+    let ctx = RefreshTokenTestContext::new(&server).await?;
     let initial_last_refresh = Utc::now() - Duration::days(1);
     let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
     let initial_auth = AuthDotJson {
@@ -715,8 +731,9 @@ async fn refresh_token_returns_transient_error_on_server_failure() -> Result<()>
         openai_api_key: None,
         tokens: Some(initial_tokens.clone()),
         last_refresh: Some(initial_last_refresh),
+        agent_identity: None,
     };
-    ctx.write_auth(&initial_auth)?;
+    ctx.write_auth(&initial_auth).await?;
 
     let err = ctx
         .auth_manager
@@ -759,7 +776,7 @@ async fn unauthorized_recovery_reloads_then_refreshes_tokens() -> Result<()> {
         .mount(&server)
         .await;
 
-    let ctx = RefreshTokenTestContext::new(&server)?;
+    let ctx = RefreshTokenTestContext::new(&server).await?;
     let initial_last_refresh = Utc::now() - Duration::days(1);
     let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
     let initial_auth = AuthDotJson {
@@ -767,8 +784,9 @@ async fn unauthorized_recovery_reloads_then_refreshes_tokens() -> Result<()> {
         openai_api_key: None,
         tokens: Some(initial_tokens.clone()),
         last_refresh: Some(initial_last_refresh),
+        agent_identity: None,
     };
-    ctx.write_auth(&initial_auth)?;
+    ctx.write_auth(&initial_auth).await?;
 
     let disk_tokens = build_tokens("disk-access-token", "disk-refresh-token");
     let disk_auth = AuthDotJson {
@@ -776,6 +794,7 @@ async fn unauthorized_recovery_reloads_then_refreshes_tokens() -> Result<()> {
         openai_api_key: None,
         tokens: Some(disk_tokens.clone()),
         last_refresh: Some(initial_last_refresh),
+        agent_identity: None,
     };
     save_auth(
         ctx.codex_home.path(),
@@ -851,7 +870,7 @@ async fn unauthorized_recovery_errors_on_account_mismatch() -> Result<()> {
         .mount(&server)
         .await;
 
-    let ctx = RefreshTokenTestContext::new(&server)?;
+    let ctx = RefreshTokenTestContext::new(&server).await?;
     let initial_last_refresh = Utc::now() - Duration::days(1);
     let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
     let initial_auth = AuthDotJson {
@@ -859,8 +878,9 @@ async fn unauthorized_recovery_errors_on_account_mismatch() -> Result<()> {
         openai_api_key: None,
         tokens: Some(initial_tokens.clone()),
         last_refresh: Some(initial_last_refresh),
+        agent_identity: None,
     };
-    ctx.write_auth(&initial_auth)?;
+    ctx.write_auth(&initial_auth).await?;
 
     let mut disk_tokens = build_tokens("disk-access-token", "disk-refresh-token");
     disk_tokens.account_id = Some("other-account".to_string());
@@ -869,6 +889,7 @@ async fn unauthorized_recovery_errors_on_account_mismatch() -> Result<()> {
         openai_api_key: None,
         tokens: Some(disk_tokens),
         last_refresh: Some(initial_last_refresh),
+        agent_identity: None,
     };
     save_auth(
         ctx.codex_home.path(),
@@ -920,14 +941,15 @@ async fn unauthorized_recovery_requires_chatgpt_auth() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = MockServer::start().await;
-    let ctx = RefreshTokenTestContext::new(&server)?;
+    let ctx = RefreshTokenTestContext::new(&server).await?;
     let auth = AuthDotJson {
         auth_mode: Some(AuthMode::ApiKey),
         openai_api_key: Some("sk-test".to_string()),
         tokens: None,
         last_refresh: None,
+        agent_identity: None,
     };
-    ctx.write_auth(&auth)?;
+    ctx.write_auth(&auth).await?;
 
     let mut recovery = ctx.auth_manager.unauthorized_recovery();
     assert!(!recovery.has_next());
@@ -952,7 +974,7 @@ struct RefreshTokenTestContext {
 }
 
 impl RefreshTokenTestContext {
-    fn new(server: &MockServer) -> Result<Self> {
+    async fn new(server: &MockServer) -> Result<Self> {
         let codex_home = TempDir::new()?;
 
         let endpoint = format!("{}/oauth/token", server.uri());
@@ -962,7 +984,9 @@ impl RefreshTokenTestContext {
             codex_home.path().to_path_buf(),
             /*enable_codex_api_key_env*/ false,
             AuthCredentialsStoreMode::File,
-        );
+            /*chatgpt_base_url*/ None,
+        )
+        .await;
 
         Ok(Self {
             codex_home,
@@ -977,13 +1001,13 @@ impl RefreshTokenTestContext {
             .context("auth.json should exist")
     }
 
-    fn write_auth(&self, auth_dot_json: &AuthDotJson) -> Result<()> {
+    async fn write_auth(&self, auth_dot_json: &AuthDotJson) -> Result<()> {
         save_auth(
             self.codex_home.path(),
             auth_dot_json,
             AuthCredentialsStoreMode::File,
         )?;
-        self.auth_manager.reload();
+        self.auth_manager.reload().await;
         Ok(())
     }
 }

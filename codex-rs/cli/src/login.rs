@@ -8,17 +8,26 @@
 //! support can request from users.
 
 use codex_app_server_protocol::AuthMode;
+use codex_backend_client::Client as BackendClient;
+use codex_backend_client::RequestError as BackendRequestError;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::config::Config;
+use codex_login::AuthManager;
 use codex_login::CLIENT_ID;
 use codex_login::CodexAuth;
+use codex_login::RefreshTokenError;
 use codex_login::ServerOptions;
+use codex_login::login_with_access_token;
 use codex_login::login_with_api_key;
 use codex_login::logout_with_revoke;
 use codex_login::run_device_code_login;
 use codex_login::run_login_server;
+use codex_protocol::account::PlanType as AccountPlanType;
 use codex_protocol::config_types::ForcedLoginMethod;
+use codex_protocol::protocol::RateLimitSnapshot;
 use codex_utils_cli::CliConfigOverrides;
+use serde::Serialize;
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::IsTerminal;
 use std::io::Read;
@@ -34,7 +43,68 @@ const CHATGPT_LOGIN_DISABLED_MESSAGE: &str =
     "ChatGPT login is disabled. Use API key login instead.";
 const API_KEY_LOGIN_DISABLED_MESSAGE: &str =
     "API key login is disabled. Use ChatGPT login instead.";
+const ACCESS_TOKEN_LOGIN_DISABLED_MESSAGE: &str =
+    "Access token login is disabled. Use API key login instead.";
 const LOGIN_SUCCESS_MESSAGE: &str = "Successfully logged in";
+
+#[derive(Debug, Clone, Copy)]
+pub struct LoginStatusOptions {
+    pub refresh: bool,
+    pub include_rate_limits: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum LoginStatusActionRequired {
+    Login,
+    Reauthenticate,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum LoginStatusState {
+    Authenticated,
+    Unauthenticated,
+    ReauthRequired,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum RefreshFailureKind {
+    Permanent,
+    Transient,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct RefreshStatusPayload {
+    attempted: bool,
+    succeeded: bool,
+    failure_kind: Option<RefreshFailureKind>,
+    failure_reason: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct LoginStatusAccountPayload {
+    email: Option<String>,
+    account_id: Option<String>,
+    chatgpt_user_id: Option<String>,
+    plan_type: Option<AccountPlanType>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct LoginStatusPayload {
+    authenticated: bool,
+    state: LoginStatusState,
+    action_required: Option<LoginStatusActionRequired>,
+    auth_mode: Option<AuthMode>,
+    api_key_preview: Option<String>,
+    account: Option<LoginStatusAccountPayload>,
+    rate_limits: Option<RateLimitSnapshot>,
+    rate_limits_by_limit_id: Option<BTreeMap<String, RateLimitSnapshot>>,
+    rate_limits_error: Option<String>,
+    refresh: RefreshStatusPayload,
+}
 
 /// Installs a small file-backed tracing layer for direct `codex login` flows.
 ///
@@ -187,31 +257,77 @@ pub async fn run_login_with_api_key(
     }
 }
 
+pub async fn run_login_with_access_token(
+    cli_config_overrides: CliConfigOverrides,
+    access_token: String,
+) -> ! {
+    let config = load_config_or_exit(cli_config_overrides).await;
+    let _login_log_guard = init_login_file_logging(&config);
+    tracing::info!("starting access token login flow");
+
+    if matches!(config.forced_login_method, Some(ForcedLoginMethod::Api)) {
+        eprintln!("{ACCESS_TOKEN_LOGIN_DISABLED_MESSAGE}");
+        std::process::exit(1);
+    }
+
+    match login_with_access_token(
+        &config.codex_home,
+        &access_token,
+        config.cli_auth_credentials_store_mode,
+        Some(&config.chatgpt_base_url),
+    )
+    .await
+    {
+        Ok(_) => {
+            eprintln!("{LOGIN_SUCCESS_MESSAGE}");
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("Error logging in with access token: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 pub fn read_api_key_from_stdin() -> String {
+    read_stdin_secret(
+        "--with-api-key expects the API key on stdin. Try piping it, e.g. `printenv OPENAI_API_KEY | codex login --with-api-key`.",
+        "Reading API key from stdin...",
+        "No API key provided via stdin.",
+    )
+}
+
+pub fn read_access_token_from_stdin() -> String {
+    read_stdin_secret(
+        "--with-access-token expects the access token on stdin. Try piping it, e.g. `printenv CODEX_ACCESS_TOKEN | codex login --with-access-token`.",
+        "Reading access token from stdin...",
+        "No access token provided via stdin.",
+    )
+}
+
+fn read_stdin_secret(terminal_message: &str, reading_message: &str, empty_message: &str) -> String {
     let mut stdin = std::io::stdin();
 
     if stdin.is_terminal() {
-        eprintln!(
-            "--with-api-key expects the API key on stdin. Try piping it, e.g. `printenv OPENAI_API_KEY | codex login --with-api-key`."
-        );
+        eprintln!("{terminal_message}");
         std::process::exit(1);
     }
 
-    eprintln!("Reading API key from stdin...");
+    eprintln!("{reading_message}");
 
     let mut buffer = String::new();
     if let Err(err) = stdin.read_to_string(&mut buffer) {
-        eprintln!("Failed to read API key from stdin: {err}");
+        eprintln!("Failed to read stdin: {err}");
         std::process::exit(1);
     }
 
-    let api_key = buffer.trim().to_string();
-    if api_key.is_empty() {
-        eprintln!("No API key provided via stdin.");
+    let secret = buffer.trim().to_string();
+    if secret.is_empty() {
+        eprintln!("{empty_message}");
         std::process::exit(1);
     }
 
-    api_key
+    secret
 }
 
 /// Login using the OAuth device code flow.
@@ -313,18 +429,202 @@ pub async fn run_login_with_device_code_fallback_to_browser(
     }
 }
 
-pub async fn run_login_status(cli_config_overrides: CliConfigOverrides) -> ! {
-    let config = load_config_or_exit(cli_config_overrides).await;
+fn refresh_status_from_error(err: &RefreshTokenError) -> RefreshStatusPayload {
+    let (failure_kind, failure_reason) = match err {
+        RefreshTokenError::Permanent(error) => (
+            Some(RefreshFailureKind::Permanent),
+            Some(format!("{:?}", error.reason).to_ascii_lowercase()),
+        ),
+        RefreshTokenError::Transient(_) => (Some(RefreshFailureKind::Transient), None),
+    };
+    RefreshStatusPayload {
+        attempted: true,
+        succeeded: false,
+        failure_kind,
+        failure_reason,
+        error: Some(err.to_string()),
+    }
+}
 
-    match CodexAuth::from_auth_storage(&config.codex_home, config.cli_auth_credentials_store_mode) {
+fn default_refresh_status(attempted: bool) -> RefreshStatusPayload {
+    RefreshStatusPayload {
+        attempted,
+        succeeded: !attempted,
+        failure_kind: None,
+        failure_reason: None,
+        error: None,
+    }
+}
+
+fn rate_limit_map_from_snapshots(
+    snapshots: Vec<RateLimitSnapshot>,
+) -> (
+    Option<RateLimitSnapshot>,
+    Option<BTreeMap<String, RateLimitSnapshot>>,
+) {
+    if snapshots.is_empty() {
+        return (None, None);
+    }
+
+    let primary = snapshots
+        .iter()
+        .find(|snapshot| snapshot.limit_id.as_deref() == Some("codex"))
+        .cloned()
+        .or_else(|| snapshots.first().cloned());
+    let by_limit_id = snapshots
+        .into_iter()
+        .map(|snapshot| {
+            let limit_id = snapshot
+                .limit_id
+                .clone()
+                .unwrap_or_else(|| "codex".to_string());
+            (limit_id, snapshot)
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    (primary, Some(by_limit_id))
+}
+
+async fn collect_login_status_payload(
+    config: &Config,
+    options: LoginStatusOptions,
+) -> Result<LoginStatusPayload, String> {
+    let auth_manager =
+        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
+    let mut refresh_status = default_refresh_status(options.refresh);
+    if options.refresh {
+        if let Err(err) = auth_manager.refresh_token().await {
+            refresh_status = refresh_status_from_error(&err);
+        } else {
+            refresh_status.succeeded = true;
+        }
+    }
+
+    let auth = auth_manager.auth_cached();
+
+    let Some(auth) = auth else {
+        return Ok(LoginStatusPayload {
+            authenticated: false,
+            state: LoginStatusState::Unauthenticated,
+            action_required: Some(LoginStatusActionRequired::Login),
+            auth_mode: None,
+            api_key_preview: None,
+            account: None,
+            rate_limits: None,
+            rate_limits_by_limit_id: None,
+            rate_limits_error: None,
+            refresh: refresh_status,
+        });
+    };
+
+    let account = auth.is_chatgpt_auth().then(|| LoginStatusAccountPayload {
+        email: auth.get_account_email(),
+        account_id: auth.get_account_id(),
+        chatgpt_user_id: auth.get_chatgpt_user_id(),
+        plan_type: auth.account_plan_type(),
+    });
+    let api_key_preview = if auth.auth_mode() == AuthMode::ApiKey {
+        auth.get_token()
+            .ok()
+            .map(|api_key| safe_format_key(&api_key))
+    } else {
+        None
+    };
+
+    let mut payload = LoginStatusPayload {
+        authenticated: true,
+        state: if refresh_status.failure_kind == Some(RefreshFailureKind::Permanent) {
+            LoginStatusState::ReauthRequired
+        } else {
+            LoginStatusState::Authenticated
+        },
+        action_required: if refresh_status.failure_kind == Some(RefreshFailureKind::Permanent) {
+            Some(LoginStatusActionRequired::Reauthenticate)
+        } else {
+            None
+        },
+        auth_mode: Some(auth.auth_mode()),
+        api_key_preview,
+        account,
+        rate_limits: None,
+        rate_limits_by_limit_id: None,
+        rate_limits_error: None,
+        refresh: refresh_status,
+    };
+
+    if !options.include_rate_limits || !auth.is_chatgpt_auth() {
+        return Ok(payload);
+    }
+
+    let client = BackendClient::from_auth(config.chatgpt_base_url.clone(), &auth)
+        .map_err(|err| err.to_string())?;
+    match client.get_rate_limits_many().await {
+        Ok(snapshots) => {
+            let (primary, by_limit_id) = rate_limit_map_from_snapshots(snapshots);
+            payload.rate_limits = primary;
+            payload.rate_limits_by_limit_id = by_limit_id;
+        }
+        Err(err) => {
+            if err
+                .downcast_ref::<BackendRequestError>()
+                .is_some_and(BackendRequestError::is_unauthorized)
+            {
+                payload.state = LoginStatusState::ReauthRequired;
+                payload.action_required = Some(LoginStatusActionRequired::Reauthenticate);
+            }
+            payload.rate_limits_error = Some(err.to_string());
+        }
+    }
+
+    Ok(payload)
+}
+
+pub async fn run_login_status(
+    cli_config_overrides: CliConfigOverrides,
+    json: bool,
+    refresh: bool,
+    include_rate_limits: bool,
+) -> ! {
+    let config = load_config_or_exit(cli_config_overrides).await;
+    let options = LoginStatusOptions {
+        refresh,
+        include_rate_limits,
+    };
+
+    if json {
+        match collect_login_status_payload(&config, options).await {
+            Ok(payload) => match serde_json::to_string_pretty(&payload) {
+                Ok(serialized) => {
+                    println!("{serialized}");
+                    std::process::exit(0);
+                }
+                Err(error) => {
+                    eprintln!("Error serializing login status: {error}");
+                    std::process::exit(1);
+                }
+            },
+            Err(error) => {
+                eprintln!("Error checking login status: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    match CodexAuth::from_auth_storage(
+        &config.codex_home,
+        config.cli_auth_credentials_store_mode,
+        Some(&config.chatgpt_base_url),
+    )
+    .await
+    {
         Ok(Some(auth)) => match auth.auth_mode() {
             AuthMode::ApiKey => match auth.get_token() {
                 Ok(api_key) => {
                     eprintln!("Logged in using an API key - {}", safe_format_key(&api_key));
                     std::process::exit(0);
                 }
-                Err(e) => {
-                    eprintln!("Unexpected error retrieving API key: {e}");
+                Err(error) => {
+                    eprintln!("Unexpected error retrieving API key: {error}");
                     std::process::exit(1);
                 }
             },
@@ -332,13 +632,17 @@ pub async fn run_login_status(cli_config_overrides: CliConfigOverrides) -> ! {
                 eprintln!("Logged in using ChatGPT");
                 std::process::exit(0);
             }
+            AuthMode::AgentIdentity => {
+                eprintln!("Logged in using access token");
+                std::process::exit(0);
+            }
         },
         Ok(None) => {
             eprintln!("Not logged in");
             std::process::exit(1);
         }
-        Err(e) => {
-            eprintln!("Error checking login status: {e}");
+        Err(error) => {
+            eprintln!("Error checking login status: {error}");
             std::process::exit(1);
         }
     }

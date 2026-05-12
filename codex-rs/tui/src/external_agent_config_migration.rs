@@ -4,6 +4,7 @@ use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
 use crate::render::Insets;
 use crate::render::RectExt as _;
 use crate::selection_list::selection_option_row_with_dim;
+use crate::style::accent_style;
 use crate::tui::FrameRequester;
 use crate::tui::Tui;
 use crate::tui::TuiEvent;
@@ -117,7 +118,7 @@ pub(crate) async fn run_external_agent_config_migration_prompt(
             match event {
                 TuiEvent::Key(key_event) => screen.handle_key(key_event),
                 TuiEvent::Paste(_) => {}
-                TuiEvent::Draw => {
+                TuiEvent::Draw | TuiEvent::Resize => {
                     let _ = tui.draw(u16::MAX, |frame| {
                         frame.render_widget_ref(&screen, frame.area());
                     });
@@ -610,7 +611,7 @@ impl ExternalAgentConfigMigrationScreen {
             let mut line = entry.line.clone();
             if selected {
                 line.spans.iter_mut().for_each(|span| {
-                    span.style = span.style.cyan().bold();
+                    span.style = span.style.patch(accent_style());
                 });
             } else if entry.kind != RenderLineKind::Item && !line.spans.is_empty() {
                 line.spans.iter_mut().for_each(|span| {
@@ -799,6 +800,7 @@ mod tests {
                     plugin_names: vec!["warehouse".to_string()],
                 },
             ],
+            ..Default::default()
         }
     }
 

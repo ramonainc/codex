@@ -33,9 +33,7 @@ pub fn apply_rollout_item(
 pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
     match item {
         RolloutItem::SessionMeta(_) | RolloutItem::TurnContext(_) => true,
-        RolloutItem::EventMsg(
-            EventMsg::TokenCount(_) | EventMsg::UserMessage(_) | EventMsg::ThreadNameUpdated(_),
-        ) => true,
+        RolloutItem::EventMsg(EventMsg::TokenCount(_) | EventMsg::UserMessage(_)) => true,
         RolloutItem::EventMsg(_) | RolloutItem::ResponseItem(_) | RolloutItem::Compacted(_) => {
             false
         }
@@ -50,6 +48,7 @@ fn apply_session_meta_from_item(metadata: &mut ThreadMetadata, meta_line: &Sessi
     }
     metadata.id = meta_line.meta.id;
     metadata.source = enum_to_string(&meta_line.meta.source);
+    metadata.thread_source = meta_line.meta.thread_source;
     metadata.agent_nickname = meta_line.meta.agent_nickname.clone();
     metadata.agent_role = meta_line.meta.agent_role.clone();
     metadata.agent_path = meta_line.meta.agent_path.clone();
@@ -95,13 +94,6 @@ fn apply_event_msg(metadata: &mut ThreadMetadata, event: &EventMsg) {
                 if !title.is_empty() {
                     metadata.title = title.to_string();
                 }
-            }
-        }
-        EventMsg::ThreadNameUpdated(updated) => {
-            if let Some(title) = updated.thread_name.as_deref()
-                && !title.trim().is_empty()
-            {
-                metadata.title = title.trim().to_string();
             }
         }
         _ => {}
@@ -159,7 +151,6 @@ mod tests {
     use codex_protocol::protocol::SessionMeta;
     use codex_protocol::protocol::SessionMetaLine;
     use codex_protocol::protocol::SessionSource;
-    use codex_protocol::protocol::ThreadNameUpdatedEvent;
     use codex_protocol::protocol::TurnContextItem;
     use codex_protocol::protocol::USER_MESSAGE_BEGIN;
     use codex_protocol::protocol::UserMessageEvent;
@@ -177,7 +168,6 @@ mod tests {
             content: vec![ContentItem::InputText {
                 text: "hello from response item".to_string(),
             }],
-            end_turn: None,
             phase: None,
         });
 
@@ -204,25 +194,6 @@ mod tests {
             Some("actual user request")
         );
         assert_eq!(metadata.title, "actual user request");
-    }
-
-    #[test]
-    fn thread_name_update_replaces_title_without_changing_first_user_message() {
-        let mut metadata = metadata_for_test();
-        metadata.title = "actual user request".to_string();
-        metadata.first_user_message = Some("actual user request".to_string());
-        let item = RolloutItem::EventMsg(EventMsg::ThreadNameUpdated(ThreadNameUpdatedEvent {
-            thread_id: metadata.id,
-            thread_name: Some("saved-session".to_string()),
-        }));
-
-        apply_rollout_item(&mut metadata, &item, "test-provider");
-
-        assert_eq!(
-            metadata.first_user_message.as_deref(),
-            Some("actual user request")
-        );
-        assert_eq!(metadata.title, "saved-session");
     }
 
     #[test]
@@ -279,6 +250,7 @@ mod tests {
                     originator: "codex_cli_rs".to_string(),
                     cli_version: "0.0.0".to_string(),
                     source: SessionSource::Cli,
+                    thread_source: None,
                     agent_path: None,
                     agent_nickname: None,
                     agent_role: None,
@@ -301,6 +273,7 @@ mod tests {
                 timezone: None,
                 approval_policy: AskForApproval::Never,
                 sandbox_policy: SandboxPolicy::DangerFullAccess,
+                permission_profile: None,
                 network: None,
                 file_system_sandbox_policy: None,
                 model: "gpt-5".to_string(),
@@ -340,6 +313,7 @@ mod tests {
                 timezone: None,
                 approval_policy: AskForApproval::OnRequest,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                permission_profile: None,
                 network: None,
                 file_system_sandbox_policy: None,
                 model: "gpt-5".to_string(),
@@ -373,6 +347,7 @@ mod tests {
                 timezone: None,
                 approval_policy: AskForApproval::OnRequest,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                permission_profile: None,
                 network: None,
                 file_system_sandbox_policy: None,
                 model: "gpt-5".to_string(),
@@ -409,6 +384,7 @@ mod tests {
                     originator: "codex_cli_rs".to_string(),
                     cli_version: "0.0.0".to_string(),
                     source: SessionSource::Cli,
+                    thread_source: None,
                     agent_path: None,
                     agent_nickname: None,
                     agent_role: None,
@@ -435,6 +411,7 @@ mod tests {
             created_at,
             updated_at: created_at,
             source: "cli".to_string(),
+            thread_source: None,
             agent_path: None,
             agent_nickname: None,
             agent_role: None,

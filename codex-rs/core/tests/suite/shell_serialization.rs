@@ -2,7 +2,7 @@
 #![allow(clippy::expect_used)]
 
 use anyhow::Result;
-use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::models::PermissionProfile;
 use core_test_support::assert_regex_match;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -136,9 +136,9 @@ async fn shell_output_stays_json_without_freeform_apply_patch(
     let responses = shell_responses(call_id, vec!["/bin/echo", "shell json"], output_type)?;
     let mock = mount_sse_sequence(&server, responses).await;
 
-    test.submit_turn_with_policy(
+    test.submit_turn_with_permission_profile(
         "run the json shell command",
-        SandboxPolicy::DangerFullAccess,
+        PermissionProfile::Disabled,
     )
     .await?;
 
@@ -192,9 +192,9 @@ async fn shell_output_is_structured_with_freeform_apply_patch(
     let responses = shell_responses(call_id, vec!["/bin/echo", "freeform shell"], output_type)?;
     let mock = mount_sse_sequence(&server, responses).await;
 
-    test.submit_turn_with_policy(
+    test.submit_turn_with_permission_profile(
         "run the structured shell command",
-        SandboxPolicy::DangerFullAccess,
+        PermissionProfile::Disabled,
     )
     .await?;
 
@@ -249,9 +249,9 @@ async fn shell_output_preserves_fixture_json_without_serialization(
     )?;
     let mock = mount_sse_sequence(&server, responses).await;
 
-    test.submit_turn_with_policy(
+    test.submit_turn_with_permission_profile(
         "read the fixture JSON with sed",
-        SandboxPolicy::DangerFullAccess,
+        PermissionProfile::Disabled,
     )
     .await?;
 
@@ -317,9 +317,9 @@ async fn shell_output_structures_fixture_with_serialization(
     )?;
     let mock = mount_sse_sequence(&server, responses).await;
 
-    test.submit_turn_with_policy(
+    test.submit_turn_with_permission_profile(
         "read the fixture JSON with structured output",
-        SandboxPolicy::DangerFullAccess,
+        PermissionProfile::Disabled,
     )
     .await?;
 
@@ -372,9 +372,9 @@ async fn shell_output_for_freeform_tool_records_duration(
     let responses = shell_responses(call_id, vec!["/bin/sh", "-c", "sleep 0.2"], output_type)?;
     let mock = mount_sse_sequence(&server, responses).await;
 
-    test.submit_turn_with_policy(
+    test.submit_turn_with_permission_profile(
         "run the structured shell command",
-        SandboxPolicy::DangerFullAccess,
+        PermissionProfile::Disabled,
     )
     .await?;
 
@@ -429,9 +429,9 @@ async fn shell_output_reserializes_truncated_content(output_type: ShellModelOutp
     let responses = shell_responses(call_id, vec!["/bin/sh", "-c", "seq 1 400"], output_type)?;
     let mock = mount_sse_sequence(&server, responses).await;
 
-    test.submit_turn_with_policy(
+    test.submit_turn_with_permission_profile(
         "run the truncation shell command",
-        SandboxPolicy::DangerFullAccess,
+        PermissionProfile::Disabled,
     )
     .await?;
 
@@ -472,7 +472,6 @@ $"#;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[test_case(ApplyPatchModelOutput::Freeform)]
-#[test_case(ApplyPatchModelOutput::Function)]
 #[test_case(ApplyPatchModelOutput::Shell)]
 #[test_case(ApplyPatchModelOutput::ShellViaHeredoc)]
 async fn apply_patch_custom_tool_output_is_structured(
@@ -495,9 +494,9 @@ async fn apply_patch_custom_tool_output_is_structured(
 
     harness
         .test()
-        .submit_turn_with_policy(
+        .submit_turn_with_permission_profile(
             "apply the patch via custom tool",
-            SandboxPolicy::DangerFullAccess,
+            PermissionProfile::Disabled,
         )
         .await?;
 
@@ -518,7 +517,6 @@ A {file_name}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[test_case(ApplyPatchModelOutput::Freeform)]
-#[test_case(ApplyPatchModelOutput::Function)]
 #[test_case(ApplyPatchModelOutput::Shell)]
 #[test_case(ApplyPatchModelOutput::ShellViaHeredoc)]
 async fn apply_patch_custom_tool_call_creates_file(
@@ -537,9 +535,9 @@ async fn apply_patch_custom_tool_call_creates_file(
 
     harness
         .test()
-        .submit_turn_with_policy(
+        .submit_turn_with_permission_profile(
             "apply the patch via custom tool to create a file",
-            SandboxPolicy::DangerFullAccess,
+            PermissionProfile::Disabled,
         )
         .await?;
 
@@ -566,7 +564,6 @@ A {file_name}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[test_case(ApplyPatchModelOutput::Freeform)]
-#[test_case(ApplyPatchModelOutput::Function)]
 #[test_case(ApplyPatchModelOutput::Shell)]
 #[test_case(ApplyPatchModelOutput::ShellViaHeredoc)]
 async fn apply_patch_custom_tool_call_updates_existing_file(
@@ -593,9 +590,9 @@ async fn apply_patch_custom_tool_call_updates_existing_file(
 
     harness
         .test()
-        .submit_turn_with_policy(
+        .submit_turn_with_permission_profile(
             "apply the patch via custom tool to update a file",
-            SandboxPolicy::DangerFullAccess,
+            PermissionProfile::Disabled,
         )
         .await?;
 
@@ -619,7 +616,6 @@ M {file_name}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[test_case(ApplyPatchModelOutput::Freeform)]
-#[test_case(ApplyPatchModelOutput::Function)]
 #[test_case(ApplyPatchModelOutput::Shell)]
 #[test_case(ApplyPatchModelOutput::ShellViaHeredoc)]
 async fn apply_patch_custom_tool_call_reports_failure_output(
@@ -645,9 +641,9 @@ async fn apply_patch_custom_tool_call_reports_failure_output(
 
     harness
         .test()
-        .submit_turn_with_policy(
+        .submit_turn_with_permission_profile(
             "attempt a failing apply_patch via custom tool",
-            SandboxPolicy::DangerFullAccess,
+            PermissionProfile::Disabled,
         )
         .await?;
 
@@ -664,20 +660,17 @@ async fn apply_patch_custom_tool_call_reports_failure_output(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[test_case(ApplyPatchModelOutput::Freeform)]
-#[test_case(ApplyPatchModelOutput::Function)]
 #[test_case(ApplyPatchModelOutput::Shell)]
 #[test_case(ApplyPatchModelOutput::ShellViaHeredoc)]
-async fn apply_patch_function_call_output_is_structured(
-    output_type: ApplyPatchModelOutput,
-) -> Result<()> {
+async fn apply_patch_tool_output_is_structured(output_type: ApplyPatchModelOutput) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let harness = apply_patch_harness().await?;
 
     let call_id = "apply-patch-function";
-    let file_name = "function_apply_patch.txt";
+    let file_name = "freeform_apply_patch.txt";
     let patch =
-        format!("*** Begin Patch\n*** Add File: {file_name}\n+via function call\n*** End Patch\n");
+        format!("*** Begin Patch\n*** Add File: {file_name}\n+via apply_patch\n*** End Patch\n");
     mount_apply_patch(
         &harness,
         call_id,
@@ -688,9 +681,9 @@ async fn apply_patch_function_call_output_is_structured(
     .await;
     harness
         .test()
-        .submit_turn_with_policy(
-            "apply the patch via function-call apply_patch",
-            SandboxPolicy::DangerFullAccess,
+        .submit_turn_with_permission_profile(
+            "apply the patch via freeform apply_patch",
+            PermissionProfile::Disabled,
         )
         .await?;
 
@@ -727,9 +720,9 @@ async fn shell_output_is_structured_for_nonzero_exit(output_type: ShellModelOutp
     let responses = shell_responses(call_id, vec!["/bin/sh", "-c", "exit 42"], output_type)?;
     let mock = mount_sse_sequence(&server, responses).await;
 
-    test.submit_turn_with_policy(
+    test.submit_turn_with_permission_profile(
         "run the failing shell command",
-        SandboxPolicy::DangerFullAccess,
+        PermissionProfile::Disabled,
     )
     .await?;
 
@@ -778,9 +771,9 @@ async fn shell_command_output_is_freeform() -> Result<()> {
     ];
     let mock = mount_sse_sequence(&server, responses).await;
 
-    test.submit_turn_with_policy(
+    test.submit_turn_with_permission_profile(
         "run the shell_command script in the user's shell",
-        SandboxPolicy::DangerFullAccess,
+        PermissionProfile::Disabled,
     )
     .await?;
 
@@ -830,9 +823,9 @@ async fn shell_command_output_is_not_truncated_under_10k_bytes() -> Result<()> {
     ];
     let mock = mount_sse_sequence(&server, responses).await;
 
-    test.submit_turn_with_policy(
+    test.submit_turn_with_permission_profile(
         "run the shell_command script in the user's shell",
-        SandboxPolicy::DangerFullAccess,
+        PermissionProfile::Disabled,
     )
     .await?;
 
@@ -881,9 +874,9 @@ async fn shell_command_output_is_not_truncated_over_10k_bytes() -> Result<()> {
     ];
     let mock = mount_sse_sequence(&server, responses).await;
 
-    test.submit_turn_with_policy(
+    test.submit_turn_with_permission_profile(
         "run the shell_command script in the user's shell",
-        SandboxPolicy::DangerFullAccess,
+        PermissionProfile::Disabled,
     )
     .await?;
 
@@ -929,9 +922,9 @@ async fn local_shell_call_output_is_structured() -> Result<()> {
     ];
     let mock = mount_sse_sequence(&server, responses).await;
 
-    test.submit_turn_with_policy(
+    test.submit_turn_with_permission_profile(
         "run the local shell command",
-        SandboxPolicy::DangerFullAccess,
+        PermissionProfile::Disabled,
     )
     .await?;
 
