@@ -258,6 +258,33 @@ fn prompt_with_stdin_context_preserves_trailing_newline() {
 }
 
 #[test]
+fn split_headless_goal_directive_sets_objective_and_removes_directive_line() {
+    let (directive, remaining) =
+        split_headless_goal_directive("/goal Complete Phase 11 planning\n\nRead the repo.")
+            .expect("goal directive");
+
+    assert_eq!(
+        directive,
+        HeadlessGoalDirective::Set {
+            objective: "Complete Phase 11 planning".to_string()
+        }
+    );
+    assert_eq!(remaining, "Read the repo.");
+}
+
+#[test]
+fn split_headless_goal_directive_supports_complete_command() {
+    let (directive, remaining) =
+        split_headless_goal_directive("/goal complete").expect("goal complete directive");
+
+    assert_eq!(directive, HeadlessGoalDirective::Complete);
+    assert_eq!(
+        remaining,
+        "The durable goal directive has been applied. Reply with the current goal status."
+    );
+}
+
+#[test]
 fn lagged_event_warning_message_is_explicit() {
     assert_eq!(
         lagged_event_warning_message(/*skipped*/ 7),

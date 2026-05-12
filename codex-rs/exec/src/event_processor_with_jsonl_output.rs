@@ -44,6 +44,8 @@ use crate::exec_events::PatchChangeKind as ExecPatchChangeKind;
 use crate::exec_events::ReasoningItem;
 use crate::exec_events::ThreadErrorEvent;
 use crate::exec_events::ThreadEvent;
+use crate::exec_events::ThreadGoalEvent;
+use crate::exec_events::ThreadGoalUpdatedEvent;
 use crate::exec_events::ThreadItem as ExecThreadItem;
 use crate::exec_events::ThreadItemDetails;
 use crate::exec_events::ThreadStartedEvent;
@@ -493,6 +495,19 @@ impl EventProcessorWithJsonOutput {
             ServerNotification::ModelVerification(_) => CodexStatus::Running,
             ServerNotification::ThreadTokenUsageUpdated(notification) => {
                 self.last_total_token_usage = Some(notification.token_usage);
+                CodexStatus::Running
+            }
+            ServerNotification::ThreadGoalUpdated(notification) => {
+                events.push(ThreadEvent::ThreadGoalUpdated(ThreadGoalUpdatedEvent {
+                    goal: ThreadGoalEvent {
+                        thread_id: notification.goal.thread_id,
+                        objective: notification.goal.objective,
+                        status: format!("{:?}", notification.goal.status).to_lowercase(),
+                        token_budget: notification.goal.token_budget,
+                        tokens_used: notification.goal.tokens_used,
+                        time_used_seconds: notification.goal.time_used_seconds,
+                    },
+                }));
                 CodexStatus::Running
             }
             ServerNotification::TurnCompleted(notification) => {
