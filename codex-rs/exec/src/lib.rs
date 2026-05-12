@@ -31,6 +31,10 @@ use codex_app_server_protocol::ReviewTarget as ApiReviewTarget;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::Thread as AppServerThread;
+use codex_app_server_protocol::ThreadGoalSetParams;
+use codex_app_server_protocol::ThreadGoalSetResponse;
+use codex_app_server_protocol::ThreadGoalStatus;
+use codex_app_server_protocol::ThreadGoalUpdatedNotification;
 use codex_app_server_protocol::ThreadItem as AppServerThreadItem;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
@@ -165,6 +169,12 @@ enum InitialOperation {
     Review {
         review_request: ReviewRequest,
     },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HeadlessGoalDirective {
+    Set { objective: String },
+    Complete,
 }
 
 enum StdinPromptBehavior {
@@ -567,6 +577,86 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     .await
 }
 
+fn split_headless_goal_directive(text: &str) -> Option<(HeadlessGoalDirective, String)> {
+    let first_line_end = text.find('\n').unwrap_or(text.len());
+    let first_line = &text[..first_line_end];
+    let command = first_line.strip_prefix("/goal ")?.trim();
+    if command.is_empty() {
+        return None;
+    }
+    let remaining = if first_line_end < text.len() {
+        text[first_line_end + 1..]
+            .trim_start_matches(|ch| ch == '\r' || ch == '\n')
+            .to_string()
+    } else {
+        String::new()
+    };
+    let remaining = if remaining.trim().is_empty() {
+        "The durable goal directive has been applied. Reply with the current goal status."
+            .to_string()
+    } else {
+        remaining
+    };
+    let directive = if command.eq_ignore_ascii_case("complete") {
+        HeadlessGoalDirective::Complete
+    } else {
+        HeadlessGoalDirective::Set {
+            objective: command.to_string(),
+        }
+    };
+    Some((directive, remaining))
+}
+
+fn extract_headless_goal_directive(items: &mut [UserInput]) -> Option<HeadlessGoalDirective> {
+    for item in items {
+        let UserInput::Text { text, .. } = item else {
+            continue;
+        };
+        let (directive, remaining) = split_headless_goal_directive(text)?;
+        *text = remaining;
+        return Some(directive);
+    }
+    None
+}
+
+async fn apply_headless_goal_directive(
+    client: &InProcessAppServerClient,
+    request_ids: &mut RequestIdSequencer,
+    thread_id: &str,
+    directive: HeadlessGoalDirective,
+    event_processor: &mut dyn EventProcessor,
+) -> anyhow::Result<()> {
+    let (objective, status) = match directive {
+        HeadlessGoalDirective::Set { objective } => {
+            (Some(objective), Some(ThreadGoalStatus::Active))
+        }
+        HeadlessGoalDirective::Complete => (None, Some(ThreadGoalStatus::Complete)),
+    };
+    let response: ThreadGoalSetResponse = send_request_with_response(
+        client,
+        ClientRequest::ThreadGoalSet {
+            request_id: request_ids.next(),
+            params: ThreadGoalSetParams {
+                thread_id: thread_id.to_string(),
+                objective,
+                status,
+                token_budget: None,
+            },
+        },
+        "thread/goal/set",
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
+    let _ = event_processor.process_server_notification(ServerNotification::ThreadGoalUpdated(
+        ThreadGoalUpdatedNotification {
+            thread_id: thread_id.to_string(),
+            turn_id: None,
+            goal: response.goal,
+        },
+    ));
+    Ok(())
+}
+
 async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     let ExecRunArgs {
         in_process_start_args,
@@ -776,9 +866,19 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
 
     let task_id = match initial_operation {
         InitialOperation::UserTurn {
-            items,
+            mut items,
             output_schema,
         } => {
+            if let Some(goal_directive) = extract_headless_goal_directive(&mut items) {
+                apply_headless_goal_directive(
+                    &client,
+                    &mut request_ids,
+                    primary_thread_id_for_span.as_str(),
+                    goal_directive,
+                    event_processor.as_mut(),
+                )
+                .await?;
+            }
             let response: TurnStartResponse = send_request_with_response(
                 &client,
                 ClientRequest::TurnStart {
