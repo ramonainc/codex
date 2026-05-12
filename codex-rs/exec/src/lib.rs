@@ -850,12 +850,18 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         }
     });
 
+    let mut shutdown_after_goal_turn_completes = false;
+    let mut goal_complete_seen = false;
     let task_id = match initial_operation {
         InitialOperation::UserTurn {
             mut items,
             output_schema,
         } => {
             if let Some(goal_directive) = extract_headless_goal_directive(&mut items) {
+                shutdown_after_goal_turn_completes = matches!(
+                    goal_directive,
+                    HeadlessGoalDirective::Set { .. } | HeadlessGoalDirective::Complete
+                );
                 apply_headless_goal_directive(
                     &client,
                     &mut request_ids,
@@ -966,22 +972,12 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 handle_server_request(&client, request, &mut error_seen).await;
             }
             InProcessServerEvent::ServerNotification(mut notification) => {
-                if let ServerNotification::Error(payload) = &notification {
-                    if payload.thread_id == primary_thread_id_for_requests
-                        && payload.turn_id == task_id
-                        && !payload.will_retry
-                    {
-                        error_seen = true;
-                    }
-                } else if let ServerNotification::TurnCompleted(payload) = &notification
-                    && payload.thread_id == primary_thread_id_for_requests
-                    && payload.turn.id == task_id
-                    && matches!(
-                        payload.turn.status,
-                        codex_app_server_protocol::TurnStatus::Failed
-                            | codex_app_server_protocol::TurnStatus::Interrupted
-                    )
-                {
+                if notification_is_terminal_error(
+                    &notification,
+                    &primary_thread_id_for_requests,
+                    &task_id,
+                    shutdown_after_goal_turn_completes,
+                ) {
                     error_seen = true;
                 }
 
@@ -993,26 +989,51 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 )
                 .await;
 
-                if should_process_notification(
-                    &notification,
-                    &primary_thread_id_for_requests,
-                    &task_id,
-                ) {
-                    match event_processor.process_server_notification(notification) {
-                        CodexStatus::Running => {}
-                        CodexStatus::InitiateShutdown => {
-                            if let Err(err) = request_shutdown(
-                                &client,
-                                &mut request_ids,
-                                &primary_thread_id_for_requests,
-                            )
-                            .await
-                            {
-                                warn!("thread/unsubscribe failed during shutdown: {err}");
-                            }
-                            break;
-                        }
+                let process_notification = if shutdown_after_goal_turn_completes {
+                    should_process_goal_notification(&notification, &primary_thread_id_for_requests)
+                } else {
+                    should_process_notification(
+                        &notification,
+                        &primary_thread_id_for_requests,
+                        &task_id,
+                    )
+                };
+                let goal_completed_now = shutdown_after_goal_turn_completes
+                    && is_completed_goal_notification(
+                        &notification,
+                        &primary_thread_id_for_requests,
+                    );
+                let goal_completion_turn_completed = shutdown_after_goal_turn_completes
+                    && goal_complete_seen
+                    && is_completed_turn_notification(
+                        &notification,
+                        &primary_thread_id_for_requests,
+                    );
+
+                if process_notification {
+                    let status = event_processor.process_server_notification(notification);
+                    if goal_completed_now {
+                        goal_complete_seen = true;
                     }
+                    let should_shutdown = if shutdown_after_goal_turn_completes {
+                        goal_completion_turn_completed || error_seen
+                    } else {
+                        matches!(status, CodexStatus::InitiateShutdown)
+                    };
+                    if should_shutdown {
+                        if let Err(err) = request_shutdown(
+                            &client,
+                            &mut request_ids,
+                            &primary_thread_id_for_requests,
+                        )
+                        .await
+                        {
+                            warn!("thread/unsubscribe failed during shutdown: {err}");
+                        }
+                        break;
+                    }
+                } else if goal_completed_now {
+                    goal_complete_seen = true;
                 }
             }
             InProcessServerEvent::Lagged { skipped } => {
@@ -1316,6 +1337,74 @@ fn should_process_notification(
         }
         ServerNotification::TurnStarted(notification) => {
             notification.thread_id == thread_id && notification.turn.id == turn_id
+        }
+        _ => false,
+    }
+}
+
+fn should_process_goal_notification(notification: &ServerNotification, thread_id: &str) -> bool {
+    match notification {
+        ServerNotification::ConfigWarning(_) | ServerNotification::DeprecationNotice(_) => true,
+        ServerNotification::Error(notification) => notification.thread_id == thread_id,
+        ServerNotification::HookCompleted(notification) => notification.thread_id == thread_id,
+        ServerNotification::HookStarted(notification) => notification.thread_id == thread_id,
+        ServerNotification::ItemCompleted(notification) => notification.thread_id == thread_id,
+        ServerNotification::ItemStarted(notification) => notification.thread_id == thread_id,
+        ServerNotification::ModelRerouted(notification) => notification.thread_id == thread_id,
+        ServerNotification::ModelVerification(notification) => notification.thread_id == thread_id,
+        ServerNotification::ThreadGoalUpdated(notification) => {
+            notification.thread_id == thread_id || notification.goal.thread_id == thread_id
+        }
+        ServerNotification::ThreadTokenUsageUpdated(notification) => {
+            notification.thread_id == thread_id
+        }
+        ServerNotification::TurnCompleted(notification) => notification.thread_id == thread_id,
+        ServerNotification::TurnDiffUpdated(notification) => notification.thread_id == thread_id,
+        ServerNotification::TurnPlanUpdated(notification) => notification.thread_id == thread_id,
+        ServerNotification::TurnStarted(notification) => notification.thread_id == thread_id,
+        _ => false,
+    }
+}
+
+fn is_completed_goal_notification(notification: &ServerNotification, thread_id: &str) -> bool {
+    let ServerNotification::ThreadGoalUpdated(notification) = notification else {
+        return false;
+    };
+    (notification.thread_id == thread_id || notification.goal.thread_id == thread_id)
+        && matches!(notification.goal.status, ThreadGoalStatus::Complete)
+}
+
+fn is_completed_turn_notification(notification: &ServerNotification, thread_id: &str) -> bool {
+    let ServerNotification::TurnCompleted(notification) = notification else {
+        return false;
+    };
+    notification.thread_id == thread_id
+        && matches!(
+            notification.turn.status,
+            codex_app_server_protocol::TurnStatus::Completed
+        )
+}
+
+fn notification_is_terminal_error(
+    notification: &ServerNotification,
+    thread_id: &str,
+    turn_id: &str,
+    goal_mode: bool,
+) -> bool {
+    match notification {
+        ServerNotification::Error(payload) => {
+            payload.thread_id == thread_id
+                && (goal_mode || payload.turn_id == turn_id)
+                && !payload.will_retry
+        }
+        ServerNotification::TurnCompleted(payload) => {
+            payload.thread_id == thread_id
+                && (goal_mode || payload.turn.id == turn_id)
+                && matches!(
+                    payload.turn.status,
+                    codex_app_server_protocol::TurnStatus::Failed
+                        | codex_app_server_protocol::TurnStatus::Interrupted
+                )
         }
         _ => false,
     }
