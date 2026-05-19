@@ -6,7 +6,11 @@ use ts_rs::TS;
 use crate::models::ImageDetail;
 
 /// Conservative cap so one user message cannot monopolize a large context window.
-pub const MAX_USER_INPUT_TEXT_CHARS: usize = 1 << 20;
+///
+/// Large-context headless runs intentionally prepack hundreds of thousands of
+/// tokens into a single turn. Keep this high enough for those runs while still
+/// bounding app-server request size.
+pub const MAX_USER_INPUT_TEXT_CHARS: usize = 4 << 20;
 
 /// User input
 #[non_exhaustive]
