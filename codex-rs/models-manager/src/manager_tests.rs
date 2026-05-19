@@ -942,8 +942,8 @@ fn bundled_models_json_roundtrips() {
 
     let default_model = &response.models[0];
     assert_eq!(default_model.slug, "gpt-5.5");
-    assert_eq!(default_model.context_window, Some(1_000_000));
-    assert_eq!(default_model.max_context_window, Some(1_000_000));
+    assert_eq!(default_model.context_window, Some(272_000));
+    assert_eq!(default_model.max_context_window, Some(272_000));
     assert_eq!(default_model.priority, 1);
     assert_eq!(default_model.visibility, ModelVisibility::List);
 }

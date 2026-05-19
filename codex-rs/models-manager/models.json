@@ -16,14 +16,14 @@
         "limit": 10000
       },
       "supports_parallel_tool_calls": true,
-      "context_window": 1000000,
-      "max_context_window": 1000000,
+      "context_window": 272000,
+      "max_context_window": 272000,
       "auto_compact_token_limit": null,
       "reasoning_summary_format": "experimental",
       "default_reasoning_summary": "none",
       "slug": "gpt-5.5",
       "display_name": "GPT-5.5",
-      "description": "Latest frontier agentic coding model with 1M context.",
+      "description": "Latest frontier agentic coding model.",
       "default_reasoning_level": "medium",
       "supported_reasoning_levels": [
         {
@@ -110,14 +110,14 @@
         "limit": 10000
       },
       "supports_parallel_tool_calls": true,
-      "context_window": 1000000,
-      "max_context_window": 1000000,
+      "context_window": 272000,
+      "max_context_window": 272000,
       "auto_compact_token_limit": null,
       "reasoning_summary_format": "experimental",
       "default_reasoning_summary": "none",
       "slug": "gpt-5.5",
       "display_name": "GPT-5.5",
-      "description": "Latest frontier agentic coding model with 1M context.",
+      "description": "Latest frontier agentic coding model.",
       "default_reasoning_level": "medium",
       "supported_reasoning_levels": [
         {
