@@ -892,10 +892,8 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             output_schema,
         } => {
             if let Some(goal_directive) = extract_headless_goal_directive(&mut items) {
-                shutdown_after_goal_turn_completes = matches!(
-                    goal_directive,
-                    HeadlessGoalDirective::Set { .. } | HeadlessGoalDirective::Complete
-                );
+                shutdown_after_goal_turn_completes =
+                    matches!(goal_directive, HeadlessGoalDirective::Complete);
                 apply_headless_goal_directive(
                     &client,
                     &mut request_ids,

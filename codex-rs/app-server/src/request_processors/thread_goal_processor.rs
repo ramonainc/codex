@@ -99,8 +99,24 @@ impl ThreadGoalRequestProcessor {
         }
 
         let thread_id = parse_thread_id_for_request(params.thread_id.as_str())?;
-        let state_db = self.state_db_for_materialized_thread(thread_id).await?;
         let running_thread = self.thread_manager.get_thread(thread_id).await.ok();
+        let state_db = match self.state_db_for_materialized_thread(thread_id).await {
+            Ok(state_db) => state_db,
+            Err(err) => {
+                if let Some(thread) = running_thread {
+                    warn!(
+                        "state db unavailable for thread goal mutation on running thread {thread_id}; applying goal to live runtime only: {}",
+                        err.message
+                    );
+                    return self
+                        .thread_goal_set_running_thread_without_state_db(
+                            request_id, thread_id, params, thread,
+                        )
+                        .await;
+                }
+                return Err(err);
+            }
+        };
         let rollout_path = match running_thread.as_ref() {
             Some(thread) => thread.rollout_path().ok_or_else(|| {
                 invalid_request(format!(
@@ -237,6 +253,79 @@ impl ThreadGoalRequestProcessor {
         if let Some(thread) = running_thread.as_ref() {
             thread.apply_external_goal_set(external_goal_set).await;
         }
+        Ok(())
+    }
+
+    async fn thread_goal_set_running_thread_without_state_db(
+        &self,
+        request_id: ConnectionRequestId,
+        thread_id: ThreadId,
+        params: ThreadGoalSetParams,
+        thread: Arc<CodexThread>,
+    ) -> Result<(), JSONRPCErrorError> {
+        thread.rollout_path().ok_or_else(|| {
+            invalid_request(format!(
+                "ephemeral thread does not support goals: {thread_id}"
+            ))
+        })?;
+
+        let listener_command_tx = {
+            let thread_state = self.thread_state_manager.thread_state(thread_id).await;
+            let thread_state = thread_state.lock().await;
+            thread_state.listener_command_tx()
+        };
+        let status = params
+            .status
+            .map(thread_goal_status_to_state)
+            .unwrap_or(codex_state::ThreadGoalStatus::Active);
+        let objective = params.objective.as_deref().map(str::trim);
+
+        if let Some(objective) = objective {
+            validate_thread_goal_objective(objective).map_err(invalid_request)?;
+        }
+        if objective.is_some() || params.token_budget.is_some() {
+            validate_goal_budget(params.token_budget.flatten()).map_err(invalid_request)?;
+        }
+
+        let objective = match objective {
+            Some(objective) if !objective.is_empty() => objective.to_string(),
+            _ if status == codex_state::ThreadGoalStatus::Complete => {
+                "Headless goal completed".to_string()
+            }
+            _ => {
+                return Err(invalid_request(format!(
+                    "cannot update goal for thread {thread_id}: no goal exists"
+                )));
+            }
+        };
+
+        thread.prepare_external_goal_mutation().await;
+        let now = chrono::Utc::now();
+        let goal = codex_state::ThreadGoal {
+            thread_id,
+            goal_id: format!("headless-{}", Uuid::new_v4()),
+            objective,
+            status,
+            token_budget: params.token_budget.flatten(),
+            tokens_used: 0,
+            time_used_seconds: 0,
+            created_at: now,
+            updated_at: now,
+        };
+        let external_goal_set = ExternalGoalSet {
+            goal: goal.clone(),
+            previous_status: ExternalGoalPreviousStatus::NewGoal,
+        };
+        let goal = api_thread_goal_from_state(goal);
+        self.outgoing
+            .send_response(
+                request_id.clone(),
+                ThreadGoalSetResponse { goal: goal.clone() },
+            )
+            .await;
+        self.emit_thread_goal_updated_ordered(thread_id, goal, listener_command_tx)
+            .await;
+        thread.apply_external_goal_set(external_goal_set).await;
         Ok(())
     }
 
