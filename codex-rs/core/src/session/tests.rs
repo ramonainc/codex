@@ -8727,6 +8727,7 @@ async fn external_goal_mutation_accounts_active_turn_before_status_change() -> a
             goal: updated_goal,
             previous_status: ExternalGoalPreviousStatus::from(&previous_goal),
         },
+        suppress_auto_continue: false,
     })
     .await?;
 
@@ -8782,6 +8783,7 @@ async fn external_objective_change_steers_active_turn() -> anyhow::Result<()> {
             goal: new_goal,
             previous_status: ExternalGoalPreviousStatus::from(&old_goal),
         },
+        suppress_auto_continue: false,
     })
     .await?;
 
@@ -8839,6 +8841,7 @@ async fn external_active_goal_set_marks_current_turn_for_accounting() -> anyhow:
             goal,
             previous_status: ExternalGoalPreviousStatus::NewGoal,
         },
+        suppress_auto_continue: false,
     })
     .await?;
 
@@ -8868,6 +8871,37 @@ async fn external_active_goal_set_marks_current_turn_for_accounting() -> anyhow:
     assert_eq!(25, goal.tokens_used);
 
     sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_active_goal_set_can_suppress_idle_continuation() -> anyhow::Result<()> {
+    let (sess, _tc, _rx, _codex_home) = make_goal_session_and_context_with_rx().await;
+
+    let state_db = goal_test_state_db(sess.as_ref()).await?;
+    let goal = state_db
+        .thread_goals()
+        .replace_thread_goal(
+            sess.conversation_id,
+            "Keep improving the benchmark",
+            codex_state::ThreadGoalStatus::Active,
+            /*token_budget*/ None,
+        )
+        .await?;
+    sess.goal_runtime_apply(GoalRuntimeEvent::ExternalSet {
+        external_set: ExternalGoalSet {
+            goal,
+            previous_status: ExternalGoalPreviousStatus::NewGoal,
+        },
+        suppress_auto_continue: true,
+    })
+    .await?;
+
+    assert!(
+        sess.active_turn.lock().await.is_none(),
+        "suppressed external goal set must not start an autonomous continuation turn"
+    );
 
     Ok(())
 }

@@ -188,11 +188,18 @@ impl CodexThread {
         }
     }
 
-    pub async fn apply_external_goal_set(&self, external_set: ExternalGoalSet) {
+    pub async fn apply_external_goal_set(
+        &self,
+        external_set: ExternalGoalSet,
+        suppress_auto_continue: bool,
+    ) {
         if let Err(err) = self
             .codex
             .session
-            .goal_runtime_apply(GoalRuntimeEvent::ExternalSet { external_set })
+            .goal_runtime_apply(GoalRuntimeEvent::ExternalSet {
+                external_set,
+                suppress_auto_continue,
+            })
             .await
         {
             tracing::warn!("failed to apply external goal status runtime effects: {err}");

@@ -606,6 +606,12 @@ pub struct ThreadGoalSetParams {
     )]
     #[ts(optional = nullable, type = "number | null")]
     pub token_budget: Option<Option<i64>>,
+    /// If true, apply the goal mutation without starting an idle continuation
+    /// turn. This is used by headless clients that immediately send an explicit
+    /// prompt turn after setting the durable goal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
+    pub suppress_auto_continue: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

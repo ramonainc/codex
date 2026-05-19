@@ -251,7 +251,12 @@ impl ThreadGoalRequestProcessor {
         self.emit_thread_goal_updated_ordered(thread_id, goal, listener_command_tx)
             .await;
         if let Some(thread) = running_thread.as_ref() {
-            thread.apply_external_goal_set(external_goal_set).await;
+            thread
+                .apply_external_goal_set(
+                    external_goal_set,
+                    params.suppress_auto_continue.unwrap_or(false),
+                )
+                .await;
         }
         Ok(())
     }
@@ -325,7 +330,12 @@ impl ThreadGoalRequestProcessor {
             .await;
         self.emit_thread_goal_updated_ordered(thread_id, goal, listener_command_tx)
             .await;
-        thread.apply_external_goal_set(external_goal_set).await;
+        thread
+            .apply_external_goal_set(
+                external_goal_set,
+                params.suppress_auto_continue.unwrap_or(false),
+            )
+            .await;
         Ok(())
     }
 

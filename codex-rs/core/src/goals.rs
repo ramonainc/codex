@@ -161,6 +161,7 @@ pub(crate) enum GoalRuntimeEvent<'a> {
     ExternalMutationStarting,
     ExternalSet {
         external_set: ExternalGoalSet,
+        suppress_auto_continue: bool,
     },
     ExternalClear,
     ThreadResumed,
@@ -404,8 +405,12 @@ impl Session {
                 }
                 Ok(())
             }),
-            GoalRuntimeEvent::ExternalSet { external_set } => Box::pin(async move {
-                self.apply_external_thread_goal_status(external_set).await;
+            GoalRuntimeEvent::ExternalSet {
+                external_set,
+                suppress_auto_continue,
+            } => Box::pin(async move {
+                self.apply_external_thread_goal_status(external_set, suppress_auto_continue)
+                    .await;
                 Ok(())
             }),
             GoalRuntimeEvent::ExternalClear => Box::pin(async move {
@@ -636,7 +641,11 @@ impl Session {
         Ok(goal)
     }
 
-    async fn apply_external_thread_goal_status(self: &Arc<Self>, external_set: ExternalGoalSet) {
+    async fn apply_external_thread_goal_status(
+        self: &Arc<Self>,
+        external_set: ExternalGoalSet,
+        suppress_auto_continue: bool,
+    ) {
         let ExternalGoalSet {
             goal,
             previous_status,
@@ -679,7 +688,9 @@ impl Session {
                         );
                     }
                 }
-                self.maybe_continue_goal_if_idle_runtime().await;
+                if !suppress_auto_continue {
+                    self.maybe_continue_goal_if_idle_runtime().await;
+                }
             }
             codex_state::ThreadGoalStatus::BudgetLimited => {
                 if self.active_turn_context().await.is_none() {

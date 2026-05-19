@@ -645,6 +645,7 @@ async fn apply_headless_goal_directive(
     directive: HeadlessGoalDirective,
     event_processor: &mut dyn EventProcessor,
 ) -> anyhow::Result<()> {
+    let suppress_auto_continue = matches!(&directive, HeadlessGoalDirective::Set { .. });
     let (objective, status) = match directive {
         HeadlessGoalDirective::Set { objective } => {
             (Some(objective), Some(ThreadGoalStatus::Active))
@@ -660,6 +661,7 @@ async fn apply_headless_goal_directive(
                 objective,
                 status,
                 token_budget: None,
+                suppress_auto_continue: suppress_auto_continue.then_some(true),
             },
         },
         "thread/goal/set",
