@@ -2708,6 +2708,7 @@ dependencies = [
  "codex-apply-patch",
  "codex-arg0",
  "codex-cloud-requirements",
+ "codex-collaboration-mode-templates",
  "codex-config",
  "codex-core",
  "codex-feedback",

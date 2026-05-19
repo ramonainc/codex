@@ -84,7 +84,10 @@ use codex_otel::set_parent_from_context;
 use codex_otel::traceparent_context_from_env;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::SandboxMode;
+use codex_protocol::config_types::Settings;
 use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
@@ -218,6 +221,7 @@ struct ExecRunArgs {
     model_provider: Option<String>,
     oss: bool,
     output_schema_path: Option<PathBuf>,
+    plan_mode: bool,
     prompt: Option<String>,
     skip_git_repo_check: bool,
     stderr_with_ansi: bool,
@@ -230,6 +234,19 @@ fn exec_root_span() -> tracing::Span {
         thread.id = field::Empty,
         turn.id = field::Empty,
     )
+}
+
+fn plan_collaboration_mode(config: &Config, model: &str) -> CollaborationMode {
+    CollaborationMode {
+        mode: ModeKind::Plan,
+        settings: Settings {
+            model: model.to_string(),
+            reasoning_effort: config
+                .plan_mode_reasoning_effort
+                .or(config.model_reasoning_effort),
+            developer_instructions: Some(codex_collaboration_mode_templates::PLAN.to_string()),
+        },
+    }
 }
 
 fn exec_stderr_env_filter() -> EnvFilter {
@@ -264,6 +281,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         json: json_mode,
         prompt,
         output_schema: output_schema_path,
+        plan_mode,
         config_overrides,
     } = cli;
     let shared = shared.into_inner();
@@ -569,6 +587,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         model_provider,
         oss,
         output_schema_path,
+        plan_mode,
         prompt,
         skip_git_repo_check,
         stderr_with_ansi,
@@ -671,6 +690,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         model_provider,
         oss,
         output_schema_path,
+        plan_mode,
         prompt,
         skip_git_repo_check,
         stderr_with_ansi,
@@ -906,7 +926,8 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                         summary: None,
                         personality: None,
                         output_schema,
-                        collaboration_mode: None,
+                        collaboration_mode: plan_mode
+                            .then(|| plan_collaboration_mode(&config, &session_configured.model)),
                     },
                 },
                 "turn/start",

@@ -53,6 +53,10 @@ pub struct Cli {
     #[arg(long = "output-schema", value_name = "FILE", global = true)]
     pub output_schema: Option<PathBuf>,
 
+    /// Run the turn in Codex Plan collaboration mode.
+    #[arg(long = "plan-mode", default_value_t = false)]
+    pub plan_mode: bool,
+
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
 
