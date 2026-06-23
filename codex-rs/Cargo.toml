@@ -73,7 +73,6 @@ members = [
     "ollama",
     "process-hardening",
     "protocol",
-    "realtime-webrtc",
     "prompts",
     "rollout",
     "rollout-trace",
