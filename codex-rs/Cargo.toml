@@ -81,6 +81,7 @@ members = [
     "responses-api-proxy",
     "response-debug-context",
     "sandboxing",
+    "semaphore-runner",
     "stdio-to-uds",
     "otel",
     "tui",
