@@ -1,6 +1,7 @@
 use std::collections::HashMap;
+use std::env;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
@@ -24,6 +25,8 @@ const RESULT_MARKER: &str = "SEMAPHORE_CODEX_APP_SERVER_TURN_RESULT_V1";
 const DEFAULT_WEBSOCKET_URL: &str = "ws://127.0.0.1:43113";
 const DEFAULT_MODEL: &str = "gpt-5-codex";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 1200;
+const BRIDGE_SCHEMA_VERSION: i32 = 1;
+const BRIDGE_REQUEST_TIMEOUT_SECONDS: u64 = 2;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Semaphore runner for Codex app-server turns")]
@@ -150,6 +153,16 @@ async fn run_turn(command: TurnCommand) -> Result<()> {
     let server_version = client.server_version().map(ToOwned::to_owned);
     let codex_home = client.codex_home().map(ToOwned::to_owned);
     let mut request_ids = RequestIds::new();
+    let mut bridge = match BridgeForwarder::from_env(command.product_turn_id.clone()) {
+        Ok(bridge) => bridge,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "Codex runner bridge forwarding is disabled"
+            );
+            None
+        }
+    };
 
     let thread: ThreadStartResponse = client
         .request_typed(ClientRequest::ThreadStart {
@@ -221,6 +234,7 @@ async fn run_turn(command: TurnCommand) -> Result<()> {
             &thread.thread.id,
             &turn.turn.id,
             &mut accumulator,
+            bridge.as_mut(),
         )
         .await?
         {
@@ -285,6 +299,7 @@ async fn handle_event(
     thread_id: &str,
     turn_id: &str,
     accumulator: &mut TurnAccumulator,
+    bridge: Option<&mut BridgeForwarder>,
 ) -> Result<bool> {
     match event {
         AppServerEvent::Lagged { skipped } => {
@@ -295,17 +310,298 @@ async fn handle_event(
         }
         AppServerEvent::ServerRequest(request) => {
             accumulator.server_request_count += 1;
+            let method = server_request_method_name(&request);
             if auto_resolve_server_request(client, request).await? {
                 accumulator.auto_approved_request_count += 1;
+                if let Some(bridge) = bridge {
+                    bridge
+                        .forward_server_request(
+                            &method,
+                            true,
+                            accumulator.server_request_count,
+                            accumulator.event_count,
+                        )
+                        .await;
+                }
+            } else if let Some(bridge) = bridge {
+                bridge
+                    .forward_server_request(
+                        &method,
+                        false,
+                        accumulator.server_request_count,
+                        accumulator.event_count,
+                    )
+                    .await;
             }
         }
         AppServerEvent::ServerNotification(notification) => {
+            if let Some(bridge) = bridge {
+                bridge
+                    .forward_notification(&notification, accumulator.event_count)
+                    .await;
+            }
             if handle_notification(notification, thread_id, turn_id, accumulator)? {
                 return Ok(true);
             }
         }
     }
     Ok(false)
+}
+
+struct BridgeForwarder {
+    client: reqwest::Client,
+    endpoint: String,
+    bridge_token: String,
+    runtime_id: String,
+    bridge_epoch: String,
+    sequence: i64,
+    product_turn_id: Option<String>,
+}
+
+impl BridgeForwarder {
+    fn from_env(product_turn_id: Option<String>) -> Result<Option<Self>> {
+        let api_base_url = optional_env("SEMAPHORE_API_BASE_URL");
+        let product_session_id = optional_env("SEMAPHORE_PRODUCT_SESSION_ID");
+        let runtime_id = optional_env("SEMAPHORE_RUNTIME_ID");
+        let bridge_token = optional_env("SEMAPHORE_SANDBOX_BRIDGE_TOKEN");
+        if api_base_url.is_none()
+            && product_session_id.is_none()
+            && runtime_id.is_none()
+            && bridge_token.is_none()
+        {
+            return Ok(None);
+        }
+        let api_base_url =
+            api_base_url.ok_or_else(|| anyhow!("SEMAPHORE_API_BASE_URL is required"))?;
+        let product_session_id = product_session_id
+            .ok_or_else(|| anyhow!("SEMAPHORE_PRODUCT_SESSION_ID is required"))?;
+        let runtime_id = runtime_id.ok_or_else(|| anyhow!("SEMAPHORE_RUNTIME_ID is required"))?;
+        let bridge_token =
+            bridge_token.ok_or_else(|| anyhow!("SEMAPHORE_SANDBOX_BRIDGE_TOKEN is required"))?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(BRIDGE_REQUEST_TIMEOUT_SECONDS))
+            .build()
+            .context("failed to build bridge HTTP client")?;
+        Ok(Some(Self {
+            client,
+            endpoint: bridge_events_url(&api_base_url, &product_session_id),
+            bridge_token,
+            bridge_epoch: default_bridge_epoch(&runtime_id),
+            runtime_id,
+            sequence: 1,
+            product_turn_id,
+        }))
+    }
+
+    async fn forward_notification(&mut self, notification: &ServerNotification, event_count: u64) {
+        let event_type = notification_bridge_event_type(notification);
+        let payload =
+            notification_bridge_payload(notification, self.product_turn_id.as_deref(), event_count);
+        if let Err(error) = self.post_event(event_type, payload).await {
+            tracing::warn!(
+                event_type,
+                error = %error,
+                "failed to forward Codex notification through sandbox bridge"
+            );
+        }
+    }
+
+    async fn forward_server_request(
+        &mut self,
+        method: &str,
+        auto_approved: bool,
+        server_request_count: u64,
+        event_count: u64,
+    ) {
+        let payload = server_request_bridge_payload(
+            method,
+            auto_approved,
+            self.product_turn_id.as_deref(),
+            server_request_count,
+            event_count,
+        );
+        if let Err(error) = self.post_event("codex.notification", payload).await {
+            tracing::warn!(
+                method,
+                error = %error,
+                "failed to forward Codex server request through sandbox bridge"
+            );
+        }
+    }
+
+    async fn post_event(&mut self, event_type: &str, payload: Value) -> Result<()> {
+        let sequence = self.sequence;
+        self.sequence += 1;
+        let body = bridge_event_body(
+            &self.runtime_id,
+            &self.bridge_epoch,
+            sequence,
+            event_type,
+            payload,
+        );
+        let response = self
+            .client
+            .post(&self.endpoint)
+            .bearer_auth(&self.bridge_token)
+            .json(&body)
+            .send()
+            .await
+            .context("failed to send bridge event")?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "bridge event was rejected with {}: {}",
+                status,
+                bridge_error_body(&body)
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn optional_env(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn bridge_events_url(api_base_url: &str, product_session_id: &str) -> String {
+    format!(
+        "{}/api/sessions/{}/bridge/events",
+        api_base_url.trim_end_matches('/'),
+        product_session_id
+    )
+}
+
+fn default_bridge_epoch(runtime_id: &str) -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or_default();
+    format!("runner-{runtime_id}:pid-{}:{millis}", std::process::id())
+}
+
+fn bridge_event_body(
+    runtime_id: &str,
+    bridge_epoch: &str,
+    sequence: i64,
+    event_type: &str,
+    payload: Value,
+) -> Value {
+    json!({
+        "runtimeId": runtime_id,
+        "schemaVersion": BRIDGE_SCHEMA_VERSION,
+        "bridgeEpoch": bridge_epoch,
+        "sequence": sequence,
+        "idempotencyKey": format!("{bridge_epoch}:{sequence}"),
+        "type": event_type,
+        "payload": payload,
+    })
+}
+
+fn notification_bridge_event_type(notification: &ServerNotification) -> &'static str {
+    match notification {
+        ServerNotification::CommandExecutionOutputDelta(_) => "command.output",
+        ServerNotification::FileChangePatchUpdated(_) => "file.changed",
+        _ => "codex.notification",
+    }
+}
+
+fn notification_bridge_payload(
+    notification: &ServerNotification,
+    product_turn_id: Option<&str>,
+    event_count: u64,
+) -> Value {
+    let method = notification_method_name(notification);
+    let value = serde_json::to_value(notification).unwrap_or_else(|_| json!({}));
+    json!({
+        "source": "semaphore-codex-runner",
+        "sourceKind": "server_notification",
+        "message": format!("Codex notification: {method}"),
+        "notificationMethod": method,
+        "productTurnId": product_turn_id,
+        "threadId": notification_param_string(&value, "threadId"),
+        "turnId": notification_param_string(&value, "turnId"),
+        "itemId": notification_param_string(&value, "itemId"),
+        "eventCount": event_count,
+        "payloadSummary": notification_payload_summary(&value),
+    })
+}
+
+fn server_request_bridge_payload(
+    method: &str,
+    auto_approved: bool,
+    product_turn_id: Option<&str>,
+    server_request_count: u64,
+    event_count: u64,
+) -> Value {
+    json!({
+        "source": "semaphore-codex-runner",
+        "sourceKind": "server_request",
+        "message": format!("Codex server request: {method}"),
+        "serverRequestMethod": method,
+        "productTurnId": product_turn_id,
+        "autoApprovedByProductPolicy": auto_approved,
+        "serverRequestCount": server_request_count,
+        "eventCount": event_count,
+    })
+}
+
+fn notification_method_name(notification: &ServerNotification) -> String {
+    serde_json::to_value(notification)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("method")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn notification_param_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get("params")
+        .and_then(|params| params.get(key))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn notification_payload_summary(value: &Value) -> Value {
+    let Some(params) = value.get("params") else {
+        return json!({});
+    };
+    let mut summary = serde_json::Map::new();
+    for key in [
+        "status",
+        "stream",
+        "changeType",
+        "path",
+        "kind",
+        "type",
+        "name",
+    ] {
+        if let Some(value) = params.get(key).and_then(Value::as_str) {
+            summary.insert(key.to_string(), json!(value));
+        }
+    }
+    for key in ["exitCode", "byteCount", "sequenceNumber"] {
+        if let Some(value) = params.get(key).and_then(Value::as_i64) {
+            summary.insert(key.to_string(), json!(value));
+        }
+    }
+    Value::Object(summary)
+}
+
+fn bridge_error_body(body: &str) -> String {
+    let summary = body.trim();
+    if summary.is_empty() {
+        "request failed".to_string()
+    } else {
+        summary.chars().take(240).collect()
+    }
 }
 
 fn handle_notification(
@@ -478,4 +774,135 @@ fn server_request_method_name(request: &ServerRequest) -> String {
                 .map(ToOwned::to_owned)
         })
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use codex_app_server_protocol::{
+        CommandExecutionOutputDeltaNotification, CurrentTimeReadParams,
+    };
+
+    use super::*;
+
+    fn agent_delta(delta: &str) -> ServerNotification {
+        ServerNotification::AgentMessageDelta(AgentMessageDeltaNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item_id: "item-1".to_string(),
+            delta: delta.to_string(),
+        })
+    }
+
+    #[test]
+    fn bridge_event_body_matches_product_ingress_envelope() {
+        let body = bridge_event_body(
+            "22222222-2222-2222-2222-222222222222",
+            "runner-epoch:pid-1:123",
+            3,
+            "codex.notification",
+            json!({"message": "Codex notification: agentMessageDelta"}),
+        );
+
+        assert_eq!(
+            body,
+            json!({
+                "runtimeId": "22222222-2222-2222-2222-222222222222",
+                "schemaVersion": 1,
+                "bridgeEpoch": "runner-epoch:pid-1:123",
+                "sequence": 3,
+                "idempotencyKey": "runner-epoch:pid-1:123:3",
+                "type": "codex.notification",
+                "payload": {
+                    "message": "Codex notification: agentMessageDelta",
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn notification_bridge_payload_keeps_ids_without_raw_text_delta() {
+        let notification = agent_delta("secret-looking assistant delta");
+
+        let payload = notification_bridge_payload(&notification, Some("product-turn-1"), 7);
+
+        assert_eq!(payload["source"], "semaphore-codex-runner");
+        assert_eq!(payload["sourceKind"], "server_notification");
+        assert_eq!(payload["notificationMethod"], "item/agentMessage/delta");
+        assert_eq!(payload["productTurnId"], "product-turn-1");
+        assert_eq!(payload["threadId"], "thread-1");
+        assert_eq!(payload["turnId"], "turn-1");
+        assert_eq!(payload["itemId"], "item-1");
+        assert_eq!(payload["eventCount"], 7);
+        assert!(
+            !payload
+                .to_string()
+                .contains("secret-looking assistant delta")
+        );
+    }
+
+    #[test]
+    fn command_output_notification_maps_to_command_output_without_delta() {
+        let notification = ServerNotification::CommandExecutionOutputDelta(
+            CommandExecutionOutputDeltaNotification {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                item_id: "command-1".to_string(),
+                delta: "raw command output".to_string(),
+            },
+        );
+
+        let payload = notification_bridge_payload(&notification, None, 9);
+
+        assert_eq!(
+            notification_bridge_event_type(&notification),
+            "command.output"
+        );
+        assert_eq!(
+            payload["notificationMethod"],
+            "item/commandExecution/outputDelta"
+        );
+        assert_eq!(payload["itemId"], "command-1");
+        assert!(!payload.to_string().contains("raw command output"));
+    }
+
+    #[test]
+    fn server_request_bridge_payload_records_product_policy_outcome() {
+        let payload = server_request_bridge_payload(
+            "execCommandApproval",
+            true,
+            Some("product-turn-1"),
+            2,
+            11,
+        );
+
+        assert_eq!(payload["source"], "semaphore-codex-runner");
+        assert_eq!(payload["sourceKind"], "server_request");
+        assert_eq!(payload["serverRequestMethod"], "execCommandApproval");
+        assert_eq!(payload["autoApprovedByProductPolicy"], true);
+        assert_eq!(payload["serverRequestCount"], 2);
+        assert_eq!(payload["eventCount"], 11);
+    }
+
+    #[test]
+    fn server_request_method_name_reads_codex_wire_method() {
+        let request = ServerRequest::CurrentTimeRead {
+            request_id: RequestId::Integer(1),
+            params: CurrentTimeReadParams {
+                thread_id: "thread-1".to_string(),
+            },
+        };
+
+        assert_eq!(server_request_method_name(&request), "currentTime/read");
+    }
+
+    #[test]
+    fn bridge_url_trims_base_url() {
+        assert_eq!(
+            bridge_events_url(
+                "https://api.example.test/",
+                "11111111-1111-1111-1111-111111111111"
+            ),
+            "https://api.example.test/api/sessions/11111111-1111-1111-1111-111111111111/bridge/events"
+        );
+    }
 }
