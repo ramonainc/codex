@@ -906,6 +906,16 @@ fn notification_payload_summary(value: &Value) -> Value {
                 "commandOutputDeltaTruncated",
                 4_096,
             );
+            if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+                summary.insert(
+                    "commandOutputDeltaByteCount".to_string(),
+                    json!(delta.len()),
+                );
+                summary.insert(
+                    "commandOutputDeltaLineCount".to_string(),
+                    json!(delta.lines().count()),
+                );
+            }
         }
         "item/commandExecution/terminalInteraction" => {
             copy_string_field(&mut summary, params, "processId", "processId", 160);
@@ -923,6 +933,16 @@ fn notification_payload_summary(value: &Value) -> Value {
                 "fileChangeOutputDeltaTruncated",
                 4_096,
             );
+            if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+                summary.insert(
+                    "fileChangeOutputDeltaByteCount".to_string(),
+                    json!(delta.len()),
+                );
+                summary.insert(
+                    "fileChangeOutputDeltaLineCount".to_string(),
+                    json!(delta.lines().count()),
+                );
+            }
         }
         "item/mcpToolCall/progress" => {
             insert_bounded_text_summary(
@@ -2160,7 +2180,30 @@ mod tests {
             payload["payloadSummary"]["commandOutputDeltaTruncated"],
             false
         );
+        assert_eq!(
+            payload["payloadSummary"]["commandOutputDeltaByteCount"],
+            "raw command output".len()
+        );
+        assert_eq!(payload["payloadSummary"]["commandOutputDeltaLineCount"], 1);
         assert!(payload.get("delta").is_none());
+
+        let file_output_summary = notification_payload_summary(&json!({
+            "method": "item/fileChange/outputDelta",
+            "params": {
+                "delta": format!("{}\n{}", "x".repeat(4_200), "done")
+            }
+        }));
+        assert_eq!(
+            file_output_summary["fileChangeOutputDelta"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            4_096
+        );
+        assert_eq!(file_output_summary["fileChangeOutputDeltaTruncated"], true);
+        assert_eq!(file_output_summary["fileChangeOutputDeltaByteCount"], 4205);
+        assert_eq!(file_output_summary["fileChangeOutputDeltaLineCount"], 2);
     }
 
     #[test]
