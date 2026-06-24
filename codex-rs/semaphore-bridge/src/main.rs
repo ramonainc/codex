@@ -1,4 +1,6 @@
 use std::env;
+use std::fs;
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -25,6 +27,7 @@ const DEFAULT_TURN_TIMEOUT_SECONDS: u64 = 1200;
 const DEFAULT_CODEX_APP_SERVER_WS: &str = "ws://127.0.0.1:43113";
 const DEFAULT_MODEL: &str = "gpt-5-codex";
 const TURN_RESULT_MARKER: &str = "SEMAPHORE_CODEX_APP_SERVER_TURN_RESULT_V1";
+const DEFAULT_SPOOL_MAX_EVENTS: usize = 256;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Semaphore sandbox bridge event forwarder")]
@@ -49,9 +52,17 @@ struct Args {
     once: bool,
     #[arg(long, env = "SEMAPHORE_SANDBOX_BRIDGE_DRAIN_COMMANDS")]
     drain_commands: bool,
+    #[arg(long, env = "SEMAPHORE_SANDBOX_BRIDGE_SPOOL_PATH")]
+    spool_path: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "SEMAPHORE_SANDBOX_BRIDGE_SPOOL_MAX_EVENTS",
+        default_value_t = DEFAULT_SPOOL_MAX_EVENTS
+    )]
+    spool_max_events: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BridgeEventBody {
     organization_id: Uuid,
@@ -91,6 +102,95 @@ struct BridgeSendResult {
     transport: &'static str,
 }
 
+struct EventSpool {
+    path: PathBuf,
+    max_events: usize,
+    events: Vec<BridgeEventBody>,
+}
+
+impl EventSpool {
+    fn load(path: PathBuf, max_events: usize) -> Result<Self> {
+        let mut spool = Self {
+            path,
+            max_events,
+            events: Vec::new(),
+        };
+        match fs::read_to_string(&spool.path) {
+            Ok(raw) => {
+                let events = serde_json::from_str::<Vec<BridgeEventBody>>(&raw)
+                    .context("bridge event spool was not valid JSON")?;
+                spool.events = events;
+                spool.enforce_bound();
+                spool.persist()?;
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to read bridge event spool {:?}", spool.path)
+                });
+            }
+        }
+        Ok(spool)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    fn front(&self) -> Option<&BridgeEventBody> {
+        self.events.first()
+    }
+
+    fn max_sequence(&self) -> i64 {
+        self.events
+            .iter()
+            .map(|event| event.sequence)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn append(&mut self, event: BridgeEventBody) -> Result<()> {
+        self.events.push(event);
+        self.enforce_bound();
+        self.persist()
+    }
+
+    fn remove_front(&mut self) -> Result<()> {
+        if !self.events.is_empty() {
+            self.events.remove(0);
+            self.persist()?;
+        }
+        Ok(())
+    }
+
+    fn enforce_bound(&mut self) {
+        if self.events.len() > self.max_events {
+            let drop_count = self.events.len() - self.max_events;
+            self.events.drain(0..drop_count);
+        }
+    }
+
+    fn persist(&self) -> Result<()> {
+        if let Some(parent) = self
+            .path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create bridge event spool directory {parent:?}")
+            })?;
+        }
+        let tmp_path = self.path.with_extension("tmp");
+        let payload = serde_json::to_vec_pretty(&self.events)
+            .context("failed to encode bridge event spool")?;
+        fs::write(&tmp_path, payload)
+            .with_context(|| format!("failed to write bridge event spool {tmp_path:?}"))?;
+        fs::rename(&tmp_path, &self.path)
+            .with_context(|| format!("failed to replace bridge event spool {:?}", self.path))?;
+        Ok(())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -101,9 +201,37 @@ async fn main() -> Result<()> {
         .bridge_epoch
         .clone()
         .unwrap_or_else(|| default_bridge_epoch(args.runtime_id));
+    let mut spool = EventSpool::load(
+        args.spool_path
+            .clone()
+            .unwrap_or_else(|| default_spool_path(args.runtime_id)),
+        args.spool_max_events,
+    )?;
 
-    let mut sequence = 1_i64;
+    let mut sequence = (spool.max_sequence() + 1).max(1);
     loop {
+        match replay_spooled_events(&args, &endpoint, &mut spool).await {
+            Ok(commands) => {
+                if args.drain_commands {
+                    for command in commands {
+                        if let Err(error) = handle_bridge_command(
+                            &args,
+                            &endpoint,
+                            &mut spool,
+                            &bridge_epoch,
+                            &mut sequence,
+                            command,
+                        )
+                        .await
+                        {
+                            eprintln!("Sandbox bridge command failed: {error:#}");
+                        }
+                    }
+                }
+            }
+            Err(error) => eprintln!("Sandbox bridge spool replay failed: {error:#}"),
+        }
+
         let event = heartbeat_event(
             args.organization_id,
             args.runtime_id,
@@ -112,18 +240,22 @@ async fn main() -> Result<()> {
             Utc::now(),
             args.drain_commands,
         );
-        match send_bridge_event(
+        let current_sequence = sequence;
+        sequence += 1;
+        match send_or_spool_event(
             &endpoint,
             &args.bridge_token,
+            &mut spool,
             &event,
             args.request_timeout_seconds,
+            true,
         )
         .await
         {
             Ok(result) => {
                 println!(
                     "SEMAPHORE_SANDBOX_BRIDGE_ACK_V1 sequence={} acknowledgedSequence={} duplicate={} accepted={} productEventId={} transport={}",
-                    sequence,
+                    current_sequence,
                     result.ack.acknowledged_sequence,
                     result.ack.duplicate,
                     result.ack.accepted,
@@ -135,12 +267,12 @@ async fn main() -> Result<()> {
                     result.transport
                 );
                 let commands = result.ack.commands.clone();
-                sequence += 1;
                 if args.drain_commands {
                     for command in commands {
                         if let Err(error) = handle_bridge_command(
                             &args,
                             &endpoint,
+                            &mut spool,
                             &bridge_epoch,
                             &mut sequence,
                             command,
@@ -156,7 +288,7 @@ async fn main() -> Result<()> {
                 }
             }
             Err(error) => {
-                eprintln!("Sandbox bridge heartbeat failed: {error:#}");
+                eprintln!("Sandbox bridge heartbeat send failed: {error:#}");
                 if args.once {
                     return Err(error);
                 }
@@ -182,6 +314,9 @@ fn validate_args(args: &Args) -> Result<()> {
     }
     if args.request_timeout_seconds == 0 {
         return Err(anyhow!("request timeout seconds must be positive"));
+    }
+    if args.spool_max_events == 0 {
+        return Err(anyhow!("spool max events must be positive"));
     }
     if let Some(epoch) = &args.bridge_epoch {
         validate_bridge_epoch(epoch)?;
@@ -221,6 +356,12 @@ fn default_bridge_epoch(runtime_id: Uuid) -> String {
         .map(|value| value.as_millis())
         .unwrap_or_default();
     format!("runtime-{runtime_id}:pid-{}:{millis}", std::process::id())
+}
+
+fn default_spool_path(runtime_id: Uuid) -> PathBuf {
+    PathBuf::from(format!(
+        "/home/daytona/.semaphore/bridge-spool/{runtime_id}.json"
+    ))
 }
 
 fn validate_bridge_epoch(value: &str) -> Result<()> {
@@ -302,6 +443,88 @@ async fn send_bridge_event(
     })
 }
 
+async fn send_or_spool_event(
+    endpoint: &str,
+    bridge_token: &str,
+    spool: &mut EventSpool,
+    event: &BridgeEventBody,
+    request_timeout_seconds: u64,
+    spool_on_failure: bool,
+) -> Result<BridgeSendResult> {
+    if !spool.is_empty() {
+        if spool_on_failure {
+            spool.append(event.clone())?;
+            return Err(anyhow!(
+                "bridge event {}:{} queued behind pending spool",
+                event.bridge_epoch,
+                event.sequence
+            ));
+        }
+        return Err(anyhow!(
+            "bridge event {}:{} not sent because pending spool must replay first",
+            event.bridge_epoch,
+            event.sequence
+        ));
+    }
+    match send_bridge_event(endpoint, bridge_token, event, request_timeout_seconds).await {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            if spool_on_failure {
+                spool.append(event.clone())?;
+                Err(error).with_context(|| {
+                    format!(
+                        "bridge event {}:{} was saved to the local spool",
+                        event.bridge_epoch, event.sequence
+                    )
+                })
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+async fn replay_spooled_events(
+    args: &Args,
+    endpoint: &str,
+    spool: &mut EventSpool,
+) -> Result<Vec<BridgeCommand>> {
+    let mut commands = Vec::new();
+    while let Some(event) = spool.front().cloned() {
+        let result = send_bridge_event(
+            endpoint,
+            &args.bridge_token,
+            &event,
+            args.request_timeout_seconds,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to replay bridge event {}:{} from spool",
+                event.bridge_epoch, event.sequence
+            )
+        })?;
+        println!(
+            "SEMAPHORE_SANDBOX_BRIDGE_REPLAY_ACK_V1 sequence={} acknowledgedSequence={} duplicate={} accepted={} productEventId={} transport={}",
+            event.sequence,
+            result.ack.acknowledged_sequence,
+            result.ack.duplicate,
+            result.ack.accepted,
+            result
+                .ack
+                .product_event_id
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            result.transport
+        );
+        if args.drain_commands {
+            commands.extend(result.ack.commands.clone());
+        }
+        spool.remove_front()?;
+    }
+    Ok(commands)
+}
+
 async fn send_bridge_event_websocket(
     endpoint: &str,
     bridge_token: &str,
@@ -359,6 +582,7 @@ async fn send_bridge_event_websocket(
 async fn handle_bridge_command(
     args: &Args,
     endpoint: &str,
+    spool: &mut EventSpool,
     bridge_epoch: &str,
     sequence: &mut i64,
     command: BridgeCommand,
@@ -366,6 +590,7 @@ async fn handle_bridge_command(
     send_bridge_status_event(
         args,
         endpoint,
+        spool,
         bridge_epoch,
         sequence,
         "bridge.command_ack",
@@ -376,6 +601,7 @@ async fn handle_bridge_command(
             "commandType": command.command_type,
             "accepted": true,
         }),
+        false,
     )
     .await?;
 
@@ -387,6 +613,7 @@ async fn handle_bridge_command(
                 send_bridge_status_event(
                     args,
                     endpoint,
+                    spool,
                     bridge_epoch,
                     sequence,
                     "turn.completed",
@@ -402,6 +629,7 @@ async fn handle_bridge_command(
                         "model": result.get("model").cloned().unwrap_or(Value::Null),
                         "result": result,
                     }),
+                    true,
                 )
                 .await
                 .map(|_| ())
@@ -411,6 +639,7 @@ async fn handle_bridge_command(
                 send_bridge_status_event(
                     args,
                     endpoint,
+                    spool,
                     bridge_epoch,
                     sequence,
                     "turn.failed",
@@ -421,6 +650,7 @@ async fn handle_bridge_command(
                         "productTurnId": product_turn_id,
                         "error": error.to_string(),
                     }),
+                    true,
                 )
                 .await?;
                 Err(error)
@@ -430,6 +660,7 @@ async fn handle_bridge_command(
             send_bridge_status_event(
                 args,
                 endpoint,
+                spool,
                 bridge_epoch,
                 sequence,
                 "bridge.command_failed",
@@ -439,6 +670,7 @@ async fn handle_bridge_command(
                     "bridgeCommandId": command.id,
                     "commandType": other,
                 }),
+                true,
             )
             .await?;
             Err(anyhow!("unsupported bridge command `{other}`"))
@@ -449,10 +681,12 @@ async fn handle_bridge_command(
 async fn send_bridge_status_event(
     args: &Args,
     endpoint: &str,
+    spool: &mut EventSpool,
     bridge_epoch: &str,
     sequence: &mut i64,
     event_type: &str,
     payload: Value,
+    spool_on_failure: bool,
 ) -> Result<BridgeSendResult> {
     let current_sequence = *sequence;
     *sequence += 1;
@@ -465,11 +699,13 @@ async fn send_bridge_status_event(
         payload,
         Utc::now(),
     );
-    send_bridge_event(
+    send_or_spool_event(
         endpoint,
         &args.bridge_token,
+        spool,
         &event,
         args.request_timeout_seconds,
+        spool_on_failure,
     )
     .await
 }
@@ -670,6 +906,26 @@ mod tests {
         Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap()
     }
 
+    fn temp_spool_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "semaphore-bridge-{name}-{}-{}.json",
+            std::process::id(),
+            Uuid::new_v4()
+        ))
+    }
+
+    fn test_event(sequence: i64, event_type: &str) -> BridgeEventBody {
+        bridge_event(
+            organization_id(),
+            runtime_id(),
+            "runtime-epoch:pid-1:123",
+            sequence,
+            event_type,
+            json!({ "source": "test" }),
+            Utc.with_ymd_and_hms(2026, 6, 24, 12, 0, 0).unwrap(),
+        )
+    }
+
     #[test]
     fn bridge_events_url_trims_base_url() {
         assert_eq!(
@@ -751,5 +1007,70 @@ mod tests {
 
         assert_eq!(result["response"], "done");
         assert_eq!(result["threadId"], "thread-1");
+    }
+
+    #[test]
+    fn event_spool_persists_and_bounds_events() {
+        let path = temp_spool_path("bounds");
+        let mut spool = EventSpool::load(path.clone(), 2).unwrap();
+
+        spool.append(test_event(1, "heartbeat")).unwrap();
+        spool.append(test_event(2, "turn.completed")).unwrap();
+        spool.append(test_event(3, "turn.failed")).unwrap();
+
+        let reloaded = EventSpool::load(path.clone(), 2).unwrap();
+        let sequences = reloaded
+            .events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>();
+
+        assert_eq!(sequences, vec![2, 3]);
+        assert_eq!(reloaded.max_sequence(), 3);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn send_or_spool_queues_durable_event_behind_pending_spool() {
+        let path = temp_spool_path("durable");
+        let mut spool = EventSpool::load(path.clone(), 8).unwrap();
+        spool.append(test_event(1, "turn.completed")).unwrap();
+
+        let result = send_or_spool_event(
+            "ws://not-used.example.test",
+            "bridge-token",
+            &mut spool,
+            &test_event(2, "turn.failed"),
+            1,
+            true,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(spool.events.len(), 2);
+        assert_eq!(spool.events[1].event_type, "turn.failed");
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn send_or_spool_does_not_queue_pre_execution_command_ack() {
+        let path = temp_spool_path("command-ack");
+        let mut spool = EventSpool::load(path.clone(), 8).unwrap();
+        spool.append(test_event(1, "turn.completed")).unwrap();
+
+        let result = send_or_spool_event(
+            "ws://not-used.example.test",
+            "bridge-token",
+            &mut spool,
+            &test_event(2, "bridge.command_ack"),
+            1,
+            false,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(spool.events.len(), 1);
+        assert_eq!(spool.events[0].event_type, "turn.completed");
+        let _ = fs::remove_file(path);
     }
 }
