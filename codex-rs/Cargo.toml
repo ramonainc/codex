@@ -80,6 +80,7 @@ members = [
     "responses-api-proxy",
     "response-debug-context",
     "sandboxing",
+    "semaphore-bridge",
     "semaphore-runner",
     "stdio-to-uds",
     "otel",
@@ -215,6 +216,7 @@ codex-rmcp-client = { path = "rmcp-client" }
 codex-rollout = { path = "rollout" }
 codex-rollout-trace = { path = "rollout-trace" }
 codex-sandboxing = { path = "sandboxing" }
+semaphore-sandbox-bridge = { path = "semaphore-bridge" }
 codex-secrets = { path = "secrets" }
 codex-shell-command = { path = "shell-command" }
 codex-shell-escalation = { path = "shell-escalation" }
