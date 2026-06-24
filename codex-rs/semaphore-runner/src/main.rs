@@ -454,12 +454,15 @@ async fn handle_event(
         AppServerEvent::ServerRequest(request) => {
             accumulator.server_request_count += 1;
             let method = server_request_method_name(&request);
+            let server_request_id = server_request_id_string(&request);
             if auto_resolve_server_request(client, request).await? {
                 accumulator.auto_approved_request_count += 1;
                 if let Some(bridge) = bridge {
                     bridge
                         .forward_server_request(
                             &method,
+                            &server_request_id,
+                            turn_id,
                             true,
                             accumulator.server_request_count,
                             accumulator.event_count,
@@ -470,6 +473,8 @@ async fn handle_event(
                 bridge
                     .forward_server_request(
                         &method,
+                        &server_request_id,
+                        turn_id,
                         false,
                         accumulator.server_request_count,
                         accumulator.event_count,
@@ -558,12 +563,16 @@ impl BridgeForwarder {
     async fn forward_server_request(
         &mut self,
         method: &str,
+        server_request_id: &str,
+        codex_turn_id: &str,
         auto_approved: bool,
         server_request_count: u64,
         event_count: u64,
     ) {
         let payload = server_request_bridge_payload(
             method,
+            server_request_id,
+            codex_turn_id,
             auto_approved,
             self.product_turn_id.as_deref(),
             server_request_count,
@@ -684,6 +693,8 @@ fn notification_bridge_payload(
 
 fn server_request_bridge_payload(
     method: &str,
+    server_request_id: &str,
+    codex_turn_id: &str,
     auto_approved: bool,
     product_turn_id: Option<&str>,
     server_request_count: u64,
@@ -693,8 +704,11 @@ fn server_request_bridge_payload(
         "source": "semaphore-codex-runner",
         "sourceKind": "server_request",
         "message": format!("Codex server request: {method}"),
+        "notificationMethod": "serverRequest/resolved",
+        "serverRequestId": server_request_id,
         "serverRequestMethod": method,
         "productTurnId": product_turn_id,
+        "codexTurnId": codex_turn_id,
         "autoApprovedByProductPolicy": auto_approved,
         "serverRequestCount": server_request_count,
         "eventCount": event_count,
@@ -1204,6 +1218,20 @@ fn server_request_method_name(request: &ServerRequest) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+fn server_request_id_string(request: &ServerRequest) -> String {
+    request_id_string(request.id())
+}
+
+fn request_id_string(request_id: &RequestId) -> String {
+    match serde_json::to_value(request_id).unwrap_or(Value::Null) {
+        Value::String(value) => value,
+        Value::Number(value) => value.to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Null => "null".to_string(),
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use codex_app_server_protocol::{
@@ -1466,6 +1494,8 @@ mod tests {
     fn server_request_bridge_payload_records_product_policy_outcome() {
         let payload = server_request_bridge_payload(
             "execCommandApproval",
+            "42",
+            "codex-turn-1",
             true,
             Some("product-turn-1"),
             2,
@@ -1474,7 +1504,10 @@ mod tests {
 
         assert_eq!(payload["source"], "semaphore-codex-runner");
         assert_eq!(payload["sourceKind"], "server_request");
+        assert_eq!(payload["notificationMethod"], "serverRequest/resolved");
+        assert_eq!(payload["serverRequestId"], "42");
         assert_eq!(payload["serverRequestMethod"], "execCommandApproval");
+        assert_eq!(payload["codexTurnId"], "codex-turn-1");
         assert_eq!(payload["autoApprovedByProductPolicy"], true);
         assert_eq!(payload["serverRequestCount"], 2);
         assert_eq!(payload["eventCount"], 11);
@@ -1490,6 +1523,25 @@ mod tests {
         };
 
         assert_eq!(server_request_method_name(&request), "currentTime/read");
+    }
+
+    #[test]
+    fn server_request_id_string_reads_codex_request_id() {
+        let integer_request = ServerRequest::CurrentTimeRead {
+            request_id: RequestId::Integer(7),
+            params: CurrentTimeReadParams {
+                thread_id: "thread-1".to_string(),
+            },
+        };
+        assert_eq!(server_request_id_string(&integer_request), "7");
+
+        let string_request = ServerRequest::CurrentTimeRead {
+            request_id: RequestId::String("request-1".to_string()),
+            params: CurrentTimeReadParams {
+                thread_id: "thread-1".to_string(),
+            },
+        };
+        assert_eq!(server_request_id_string(&string_request), "request-1");
     }
 
     #[test]
