@@ -930,6 +930,7 @@ async fn execute_turn_start_command(
     let cwd = command_payload_string(command, "workspaceDir");
     let codex_home = command_payload_string(command, "codexHome");
     let client_message_id = command_payload_string(command, "clientMessageId");
+    let thread_id = command_payload_string(command, "threadId");
     let api_base_url = args.api_base_url.trim_end_matches('/').to_string();
     let organization_id = args.organization_id.to_string();
     let session_id = args.session_id.to_string();
@@ -939,13 +940,12 @@ async fn execute_turn_start_command(
 
     let mut process = Command::new(runner);
     process
-        .arg("turn")
-        .arg("--websocket-url")
-        .arg(websocket_url)
-        .arg("--model")
-        .arg(model)
-        .arg("--message")
-        .arg(message)
+        .args(turn_start_runner_args(
+            &websocket_url,
+            &model,
+            &message,
+            thread_id.as_deref(),
+        ))
         .env("SEMAPHORE_API_BASE_URL", api_base_url)
         .env("SEMAPHORE_ORGANIZATION_ID", organization_id)
         .env("SEMAPHORE_PRODUCT_SESSION_ID", session_id)
@@ -989,6 +989,28 @@ async fn execute_turn_start_command(
         );
     }
     parse_turn_result(&stdout)
+}
+
+fn turn_start_runner_args(
+    websocket_url: &str,
+    model: &str,
+    message: &str,
+    thread_id: Option<&str>,
+) -> Vec<String> {
+    let mut args = vec![
+        "turn".to_string(),
+        "--websocket-url".to_string(),
+        websocket_url.to_string(),
+        "--model".to_string(),
+        model.to_string(),
+        "--message".to_string(),
+        message.to_string(),
+    ];
+    if let Some(thread_id) = thread_id.map(str::trim).filter(|value| !value.is_empty()) {
+        args.push("--thread-id".to_string());
+        args.push(thread_id.to_string());
+    }
+    args
 }
 
 async fn wait_for_turn_runner_with_control(
@@ -1539,6 +1561,39 @@ mod tests {
 
         assert_eq!(result["command"], "turn.interrupt");
         assert_eq!(result["accepted"], true);
+    }
+
+    #[test]
+    fn turn_start_runner_args_resume_existing_thread_when_present() {
+        let args = turn_start_runner_args(
+            "ws://127.0.0.1:43113",
+            "gpt-validation",
+            "continue",
+            Some("  thread-1  "),
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "turn",
+                "--websocket-url",
+                "ws://127.0.0.1:43113",
+                "--model",
+                "gpt-validation",
+                "--message",
+                "continue",
+                "--thread-id",
+                "thread-1",
+            ]
+        );
+        assert!(
+            !turn_start_runner_args("ws://x", "model", "message", None)
+                .contains(&"--thread-id".to_string())
+        );
+        assert!(
+            !turn_start_runner_args("ws://x", "model", "message", Some(" "))
+                .contains(&"--thread-id".to_string())
+        );
     }
 
     #[test]

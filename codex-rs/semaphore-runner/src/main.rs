@@ -14,9 +14,10 @@ use codex_app_server_protocol::{
     FileChangeApprovalDecision, FileChangeRequestApprovalResponse, GrantedPermissionProfile,
     JSONRPCErrorError, McpServerElicitationAction, McpServerElicitationRequestResponse,
     PermissionGrantScope, PermissionsRequestApprovalResponse, RequestId, SandboxMode,
-    SandboxPolicy, ServerNotification, ServerRequest, ThreadItem, ThreadSource, ThreadStartParams,
-    ThreadStartResponse, TurnInterruptParams, TurnInterruptResponse, TurnStartParams,
-    TurnStartResponse, TurnStatus, TurnSteerParams, TurnSteerResponse, UserInput,
+    SandboxPolicy, ServerNotification, ServerRequest, ThreadItem, ThreadResumeParams,
+    ThreadResumeResponse, ThreadSource, ThreadStartParams, ThreadStartResponse,
+    TurnInterruptParams, TurnInterruptResponse, TurnStartParams, TurnStartResponse, TurnStatus,
+    TurnSteerParams, TurnSteerResponse, UserInput,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -58,6 +59,8 @@ struct TurnCommand {
     message_file: Option<PathBuf>,
     #[arg(long, env = "SEMAPHORE_CODEX_CLIENT_MESSAGE_ID")]
     client_message_id: Option<String>,
+    #[arg(long, env = "SEMAPHORE_CODEX_THREAD_ID")]
+    thread_id: Option<String>,
     #[arg(long, env = "SEMAPHORE_PRODUCT_TURN_ID")]
     product_turn_id: Option<String>,
     #[arg(long, env = "SEMAPHORE_CODEX_TIMEOUT_SECONDS", default_value_t = DEFAULT_TIMEOUT_SECONDS)]
@@ -107,6 +110,8 @@ struct TurnResult {
     assistant_item_id: Option<String>,
     model: String,
     workspace_dir: Option<String>,
+    thread_reused: bool,
+    thread_mode: &'static str,
     server_version: Option<String>,
     codex_home: Option<String>,
     event_count: u64,
@@ -198,24 +203,7 @@ async fn run_turn(command: TurnCommand) -> Result<()> {
         }
     };
 
-    let thread: ThreadStartResponse = client
-        .request_typed(ClientRequest::ThreadStart {
-            request_id: request_ids.next(),
-            params: ThreadStartParams {
-                model: Some(command.model.clone()),
-                model_provider: Some("openai".to_string()),
-                cwd: cwd_string.clone(),
-                approval_policy: Some(AskForApproval::Never),
-                approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
-                sandbox: Some(SandboxMode::DangerFullAccess),
-                ephemeral: Some(false),
-                thread_source: Some(ThreadSource::Feature("semaphore_operator".to_string())),
-                experimental_raw_events: true,
-                ..ThreadStartParams::default()
-            },
-        })
-        .await
-        .context("thread/start failed")?;
+    let thread = ensure_thread(&client, &mut request_ids, &command, cwd_string.clone()).await?;
 
     let mut responsesapi_client_metadata = HashMap::from([
         (
@@ -233,7 +221,7 @@ async fn run_turn(command: TurnCommand) -> Result<()> {
         .request_typed(ClientRequest::TurnStart {
             request_id: request_ids.next(),
             params: TurnStartParams {
-                thread_id: thread.thread.id.clone(),
+                thread_id: thread.id.clone(),
                 client_user_message_id: command.client_message_id.clone(),
                 input: vec![UserInput::Text {
                     text: message,
@@ -265,7 +253,7 @@ async fn run_turn(command: TurnCommand) -> Result<()> {
         if handle_event(
             &client,
             event,
-            &thread.thread.id,
+            &thread.id,
             &turn.turn.id,
             &mut accumulator,
             bridge.as_mut(),
@@ -300,12 +288,14 @@ async fn run_turn(command: TurnCommand) -> Result<()> {
             "completed"
         },
         response,
-        thread_id: thread.thread.id.clone(),
-        codex_session_id: thread.thread.session_id.clone(),
+        thread_id: thread.id.clone(),
+        codex_session_id: thread.session_id.clone(),
         turn_id: turn.turn.id.clone(),
         assistant_item_id: accumulator.assistant_item_id,
         model: command.model,
         workspace_dir: cwd_string,
+        thread_reused: thread.reused,
+        thread_mode: thread.mode,
         server_version,
         codex_home,
         event_count: accumulator.event_count,
@@ -319,6 +309,69 @@ async fn run_turn(command: TurnCommand) -> Result<()> {
     println!("{RESULT_MARKER}");
     println!("{}", serde_json::to_string(&result)?);
     Ok(())
+}
+
+struct PreparedThread {
+    id: String,
+    session_id: String,
+    reused: bool,
+    mode: &'static str,
+}
+
+async fn ensure_thread(
+    client: &RemoteAppServerClient,
+    request_ids: &mut RequestIds,
+    command: &TurnCommand,
+    cwd_string: Option<String>,
+) -> Result<PreparedThread> {
+    if let Some(thread_id) = clean_optional_string(command.thread_id.as_deref()) {
+        let resumed: ThreadResumeResponse = client
+            .request_typed(ClientRequest::ThreadResume {
+                request_id: request_ids.next(),
+                params: ThreadResumeParams {
+                    thread_id,
+                    model: Some(command.model.clone()),
+                    cwd: cwd_string,
+                    approval_policy: Some(AskForApproval::Never),
+                    approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
+                    sandbox: Some(SandboxMode::DangerFullAccess),
+                    ..ThreadResumeParams::default()
+                },
+            })
+            .await
+            .context("thread/resume failed")?;
+        return Ok(PreparedThread {
+            id: resumed.thread.id,
+            session_id: resumed.thread.session_id,
+            reused: true,
+            mode: "resume_existing",
+        });
+    }
+
+    let started: ThreadStartResponse = client
+        .request_typed(ClientRequest::ThreadStart {
+            request_id: request_ids.next(),
+            params: ThreadStartParams {
+                model: Some(command.model.clone()),
+                model_provider: Some("openai".to_string()),
+                cwd: cwd_string,
+                approval_policy: Some(AskForApproval::Never),
+                approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
+                sandbox: Some(SandboxMode::DangerFullAccess),
+                ephemeral: Some(false),
+                thread_source: Some(ThreadSource::Feature("semaphore_operator".to_string())),
+                experimental_raw_events: true,
+                ..ThreadStartParams::default()
+            },
+        })
+        .await
+        .context("thread/start failed")?;
+    Ok(PreparedThread {
+        id: started.thread.id,
+        session_id: started.thread.session_id,
+        reused: false,
+        mode: "start_new",
+    })
 }
 
 async fn run_steer(command: TurnSteerCommand) -> Result<()> {
@@ -624,6 +677,13 @@ fn optional_env(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn clean_optional_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn bridge_events_url(api_base_url: &str, product_session_id: &str) -> String {
@@ -1276,6 +1336,42 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn turn_result_records_thread_resume_mode() {
+        let result = TurnResult {
+            schema_version: 1,
+            source: "codex_app_server_remote_client",
+            status: "completed",
+            response: "done".to_string(),
+            thread_id: "thread-1".to_string(),
+            codex_session_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            assistant_item_id: None,
+            model: "gpt-validation".to_string(),
+            workspace_dir: Some("/workspace/project".to_string()),
+            thread_reused: true,
+            thread_mode: "resume_existing",
+            server_version: Some("0.0.0".to_string()),
+            codex_home: Some("/home/daytona/.semaphore-codex-home".to_string()),
+            event_count: 4,
+            assistant_delta_count: 1,
+            item_completed_count: 1,
+            server_request_count: 0,
+            auto_approved_request_count: 0,
+            timeout_seconds: 1200,
+        };
+
+        let value = serde_json::to_value(result).unwrap();
+
+        assert_eq!(value["threadReused"], true);
+        assert_eq!(value["threadMode"], "resume_existing");
+        assert_eq!(
+            clean_optional_string(Some("  thread-1  ")).as_deref(),
+            Some("thread-1")
+        );
+        assert_eq!(clean_optional_string(Some("   ")), None);
     }
 
     #[test]
