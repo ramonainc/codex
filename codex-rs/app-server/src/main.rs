@@ -11,8 +11,9 @@ use codex_protocol::protocol::SessionSource;
 use codex_utils_cli::CliConfigOverrides;
 use std::path::PathBuf;
 
-// Debug-only test hook: lets integration tests point the server at a temporary
-// managed config file without writing to /etc.
+// Semaphore runs codex-app-server from a Daytona snapshot where the managed
+// config is session-scoped, not installed under /etc. Keep this available in
+// release builds so the product-owned policy layer is active in sandboxes.
 const MANAGED_CONFIG_PATH_ENV_VAR: &str = "CODEX_APP_SERVER_MANAGED_CONFIG_PATH";
 const DISABLE_MANAGED_CONFIG_ENV_VAR: &str = "CODEX_APP_SERVER_DISABLE_MANAGED_CONFIG";
 
@@ -74,7 +75,7 @@ fn main() -> anyhow::Result<()> {
         let loader_overrides = if disable_managed_config_from_debug_env() {
             LoaderOverrides::without_managed_config_for_tests()
         } else {
-            managed_config_path_from_debug_env()
+            managed_config_path_from_env()
                 .map(LoaderOverrides::with_managed_config_path_for_tests)
                 .unwrap_or_default()
         };
@@ -119,19 +120,18 @@ fn disable_managed_config_from_debug_env() -> bool {
     false
 }
 
-fn managed_config_path_from_debug_env() -> Option<PathBuf> {
-    #[cfg(debug_assertions)]
-    {
-        if let Ok(value) = std::env::var(MANAGED_CONFIG_PATH_ENV_VAR) {
-            return if value.is_empty() {
-                None
-            } else {
-                Some(PathBuf::from(value))
-            };
-        }
-    }
+fn managed_config_path_from_env() -> Option<PathBuf> {
+    managed_config_path_from_env_value(std::env::var(MANAGED_CONFIG_PATH_ENV_VAR).ok())
+}
 
-    None
+fn managed_config_path_from_env_value(value: Option<String>) -> Option<PathBuf> {
+    value.and_then(|value| {
+        if value.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(value))
+        }
+    })
 }
 
 #[cfg(test)]
