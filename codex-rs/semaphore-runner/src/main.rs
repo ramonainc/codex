@@ -1440,6 +1440,7 @@ fn summarize_thread_item(item: &Value) -> Value {
         "revisedPromptPreviewTruncated",
         1_024,
     );
+    insert_image_generation_result_summary(&mut summary, item);
     insert_i64_field(&mut summary, item, "exitCode", "exitCode");
     insert_i64_field(&mut summary, item, "durationMs", "durationMs");
     if let Some(success) = item.get("success").and_then(Value::as_bool) {
@@ -1463,6 +1464,64 @@ fn summarize_thread_item(item: &Value) -> Value {
         }
     }
     Value::Object(summary)
+}
+
+fn insert_image_generation_result_summary(
+    summary: &mut serde_json::Map<String, Value>,
+    item: &Value,
+) {
+    if item.get("type").and_then(Value::as_str) != Some("imageGeneration") {
+        return;
+    }
+    let Some(result) = item.get("result").and_then(Value::as_str) else {
+        return;
+    };
+    summary.insert("resultByteCount".to_string(), json!(result.len()));
+    let result_kind = image_generation_result_kind(result);
+    summary.insert("resultKind".to_string(), json!(result_kind));
+    if let Some((preview, truncated)) = safe_image_generation_result_preview(result, result_kind) {
+        summary.insert("resultPreview".to_string(), json!(preview));
+        summary.insert("resultPreviewTruncated".to_string(), json!(truncated));
+    }
+}
+
+fn image_generation_result_kind(value: &str) -> &'static str {
+    let value = value.trim();
+    if value.is_empty() {
+        "empty"
+    } else if value.starts_with("data:") {
+        "data_url"
+    } else if value.starts_with("http://") || value.starts_with("https://") {
+        "url"
+    } else if value.starts_with('/') {
+        "sandbox_path"
+    } else if looks_like_base64_payload(value) {
+        "base64_payload"
+    } else {
+        "text"
+    }
+}
+
+fn looks_like_base64_payload(value: &str) -> bool {
+    value.len() >= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'\r' | b'\n')
+        })
+}
+
+fn safe_image_generation_result_preview(value: &str, result_kind: &str) -> Option<(String, bool)> {
+    match result_kind {
+        "sandbox_path" if safe_result_path(value) => Some(bounded_text(value, 512)),
+        "text" => Some(bounded_text(value, 256)),
+        _ => None,
+    }
+}
+
+fn safe_result_path(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 512
+        && value.starts_with('/')
+        && !value.chars().any(char::is_control)
 }
 
 fn thread_item_outcome(item: &Value) -> Option<&'static str> {
@@ -1934,7 +1993,7 @@ mod tests {
                     "id": "image-1",
                     "status": "completed",
                     "revisedPrompt": format!("{}{}", "paint ", "x".repeat(2_000)),
-                    "result": {"raw": "image bytes or remote payload"},
+                    "result": "a".repeat(256),
                     "savedPath": "/home/daytona/workspace/.codex/images/generated.png"
                 }
             }
@@ -1957,8 +2016,48 @@ mod tests {
         );
         assert_eq!(summary["item"]["revisedPromptPreviewTruncated"], true);
         assert_eq!(summary["item"]["resultPresent"], true);
+        assert_eq!(summary["item"]["resultKind"], "base64_payload");
+        assert_eq!(summary["item"]["resultByteCount"], 256);
+        assert!(summary["item"].get("resultPreview").is_none());
         assert!(summary["item"].get("result").is_none());
         assert!(summary["item"].get("revisedPrompt").is_none());
+    }
+
+    #[test]
+    fn image_generation_result_summary_allows_safe_handles_only() {
+        let summary = notification_payload_summary(&json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "imageGeneration",
+                    "id": "image-2",
+                    "status": "completed",
+                    "result": "/home/daytona/workspace/.codex/images/generated.png"
+                }
+            }
+        }));
+
+        assert_eq!(summary["item"]["resultKind"], "sandbox_path");
+        assert_eq!(
+            summary["item"]["resultPreview"],
+            "/home/daytona/workspace/.codex/images/generated.png"
+        );
+        assert_eq!(summary["item"]["resultPreviewTruncated"], false);
+
+        let summary = notification_payload_summary(&json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "imageGeneration",
+                    "id": "image-3",
+                    "status": "completed",
+                    "result": "data:image/png;base64,abcd"
+                }
+            }
+        }));
+
+        assert_eq!(summary["item"]["resultKind"], "data_url");
+        assert!(summary["item"].get("resultPreview").is_none());
     }
 
     #[test]
