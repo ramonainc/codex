@@ -532,7 +532,7 @@ fn notification_bridge_payload(
         "notificationMethod": method,
         "productTurnId": product_turn_id,
         "threadId": notification_param_string(&value, "threadId"),
-        "turnId": notification_param_string(&value, "turnId"),
+        "turnId": notification_turn_id(&value),
         "itemId": notification_param_string(&value, "itemId"),
         "eventCount": event_count,
         "payloadSummary": notification_payload_summary(&value),
@@ -576,6 +576,17 @@ fn notification_param_string(value: &Value, key: &str) -> Option<String> {
         .and_then(|params| params.get(key))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn notification_turn_id(value: &Value) -> Option<String> {
+    notification_param_string(value, "turnId").or_else(|| {
+        value
+            .get("params")
+            .and_then(|params| params.get("turn"))
+            .and_then(|turn| turn.get("id"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    })
 }
 
 fn notification_payload_summary(value: &Value) -> Value {
@@ -788,7 +799,8 @@ fn server_request_method_name(request: &ServerRequest) -> String {
 #[cfg(test)]
 mod tests {
     use codex_app_server_protocol::{
-        CommandExecutionOutputDeltaNotification, CurrentTimeReadParams,
+        CommandExecutionOutputDeltaNotification, CurrentTimeReadParams, Turn, TurnItemsView,
+        TurnStartedNotification,
     };
 
     use super::*;
@@ -849,6 +861,30 @@ mod tests {
                 .to_string()
                 .contains("secret-looking assistant delta")
         );
+    }
+
+    #[test]
+    fn turn_started_notification_bridge_payload_extracts_nested_turn_id() {
+        let notification = ServerNotification::TurnStarted(TurnStartedNotification {
+            thread_id: "thread-1".to_string(),
+            turn: Turn {
+                id: "turn-1".to_string(),
+                items: Vec::new(),
+                items_view: TurnItemsView::NotLoaded,
+                status: TurnStatus::InProgress,
+                error: None,
+                started_at: Some(1),
+                completed_at: None,
+                duration_ms: None,
+            },
+        });
+
+        let payload = notification_bridge_payload(&notification, Some("product-turn-1"), 3);
+
+        assert_eq!(payload["notificationMethod"], "turn/started");
+        assert_eq!(payload["productTurnId"], "product-turn-1");
+        assert_eq!(payload["threadId"], "thread-1");
+        assert_eq!(payload["turnId"], "turn-1");
     }
 
     #[test]
