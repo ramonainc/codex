@@ -899,6 +899,23 @@ fn notification_payload_summary(value: &Value) -> Value {
                 1_024,
             );
         }
+        "thread/tokenUsage/updated" => {
+            insert_token_usage_summary(&mut summary, params);
+        }
+        "turn/diff/updated" => {
+            insert_bounded_text_summary(
+                &mut summary,
+                params,
+                "diff",
+                "diffPreview",
+                "diffPreviewTruncated",
+                4_096,
+            );
+            if let Some(diff) = params.get("diff").and_then(Value::as_str) {
+                summary.insert("diffLineCount".to_string(), json!(diff.lines().count()));
+                summary.insert("diffByteCount".to_string(), json!(diff.len()));
+            }
+        }
         "item/fileChange/patchUpdated" => {
             if let Some(changes) = params.get("changes").and_then(Value::as_array) {
                 summary.insert("changeCount".to_string(), json!(changes.len()));
@@ -932,6 +949,53 @@ fn notification_payload_summary(value: &Value) -> Value {
         _ => {}
     }
     Value::Object(summary)
+}
+
+fn insert_token_usage_summary(summary: &mut serde_json::Map<String, Value>, params: &Value) {
+    let Some(token_usage) = params.get("tokenUsage") else {
+        return;
+    };
+    insert_token_breakdown(summary, token_usage.get("total"), "");
+    insert_token_breakdown(summary, token_usage.get("last"), "last");
+    insert_i64_field(
+        summary,
+        token_usage,
+        "modelContextWindow",
+        "modelContextWindow",
+    );
+}
+
+fn insert_token_breakdown(
+    summary: &mut serde_json::Map<String, Value>,
+    value: Option<&Value>,
+    prefix: &str,
+) {
+    let Some(value) = value else {
+        return;
+    };
+    let fields = [
+        ("totalTokens", "totalTokens"),
+        ("inputTokens", "inputTokens"),
+        ("cachedInputTokens", "cachedInputTokens"),
+        ("outputTokens", "outputTokens"),
+        ("reasoningOutputTokens", "reasoningOutputTokens"),
+    ];
+    for (source_key, output_key) in fields {
+        let output_key = if prefix.is_empty() {
+            output_key.to_string()
+        } else {
+            format!("{prefix}{}", uppercase_first(output_key))
+        };
+        insert_i64_field(summary, value, source_key, &output_key);
+    }
+}
+
+fn uppercase_first(value: &str) -> String {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    format!("{}{}", first.to_ascii_uppercase(), chars.as_str())
 }
 
 fn insert_bounded_text_summary(
@@ -1527,6 +1591,63 @@ mod tests {
             true
         );
         assert_eq!(reasoning_summary["summaryIndex"], 2);
+    }
+
+    #[test]
+    fn token_usage_and_turn_diff_summaries_are_bounded() {
+        let token_summary = notification_payload_summary(&json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "tokenUsage": {
+                    "total": {
+                        "totalTokens": 1000,
+                        "inputTokens": 600,
+                        "cachedInputTokens": 200,
+                        "outputTokens": 400,
+                        "reasoningOutputTokens": 150
+                    },
+                    "last": {
+                        "totalTokens": 120,
+                        "inputTokens": 80,
+                        "cachedInputTokens": 20,
+                        "outputTokens": 40,
+                        "reasoningOutputTokens": 10
+                    },
+                    "modelContextWindow": 200000
+                }
+            }
+        }));
+
+        assert_eq!(token_summary["totalTokens"], 1000);
+        assert_eq!(token_summary["inputTokens"], 600);
+        assert_eq!(token_summary["cachedInputTokens"], 200);
+        assert_eq!(token_summary["outputTokens"], 400);
+        assert_eq!(token_summary["reasoningOutputTokens"], 150);
+        assert_eq!(token_summary["lastTotalTokens"], 120);
+        assert_eq!(token_summary["lastInputTokens"], 80);
+        assert_eq!(token_summary["lastCachedInputTokens"], 20);
+        assert_eq!(token_summary["lastOutputTokens"], 40);
+        assert_eq!(token_summary["lastReasoningOutputTokens"], 10);
+        assert_eq!(token_summary["modelContextWindow"], 200000);
+
+        let diff_summary = notification_payload_summary(&json!({
+            "method": "turn/diff/updated",
+            "params": {
+                "diff": format!("{}\n{}", "+".repeat(4_200), "-changed")
+            }
+        }));
+
+        assert_eq!(
+            diff_summary["diffPreview"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            4_096
+        );
+        assert_eq!(diff_summary["diffPreviewTruncated"], true);
+        assert_eq!(diff_summary["diffLineCount"], 2);
+        assert_eq!(diff_summary["diffByteCount"], 4209);
     }
 
     #[test]
