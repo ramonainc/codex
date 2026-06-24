@@ -3,9 +3,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use reqwest::StatusCode;
+use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
+use futures::SinkExt;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use uuid::Uuid;
 
 const BRIDGE_SCHEMA_VERSION: i32 = 1;
@@ -59,20 +66,22 @@ struct BridgeAck {
     product_event_id: Option<i64>,
 }
 
+#[derive(Debug)]
+struct BridgeSendResult {
+    ack: BridgeAck,
+    transport: &'static str,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
 
-    let endpoint = bridge_events_url(&args.api_base_url, args.session_id);
+    let endpoint = bridge_events_ws_url(&args.api_base_url, args.session_id)?;
     let bridge_epoch = args
         .bridge_epoch
         .clone()
         .unwrap_or_else(|| default_bridge_epoch(args.runtime_id));
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(args.request_timeout_seconds))
-        .build()
-        .context("failed to build bridge HTTP client")?;
 
     let mut sequence = 1_i64;
     loop {
@@ -83,17 +92,27 @@ async fn main() -> Result<()> {
             sequence,
             Utc::now(),
         );
-        match post_bridge_event(&client, &endpoint, &args.bridge_token, &event).await {
-            Ok(ack) => {
+        match send_bridge_event(
+            &endpoint,
+            &args.bridge_token,
+            &event,
+            args.request_timeout_seconds,
+        )
+        .await
+        {
+            Ok(result) => {
                 println!(
-                    "SEMAPHORE_SANDBOX_BRIDGE_ACK_V1 sequence={} acknowledgedSequence={} duplicate={} accepted={} productEventId={}",
+                    "SEMAPHORE_SANDBOX_BRIDGE_ACK_V1 sequence={} acknowledgedSequence={} duplicate={} accepted={} productEventId={} transport={}",
                     sequence,
-                    ack.acknowledged_sequence,
-                    ack.duplicate,
-                    ack.accepted,
-                    ack.product_event_id
+                    result.ack.acknowledged_sequence,
+                    result.ack.duplicate,
+                    result.ack.accepted,
+                    result
+                        .ack
+                        .product_event_id
                         .map(|value| value.to_string())
-                        .unwrap_or_default()
+                        .unwrap_or_default(),
+                    result.transport
                 );
                 sequence += 1;
                 if args.once {
@@ -142,6 +161,24 @@ fn bridge_events_url(api_base_url: &str, session_id: Uuid) -> String {
     )
 }
 
+fn bridge_events_ws_url(api_base_url: &str, session_id: Uuid) -> Result<String> {
+    let base = api_base_url.trim_end_matches('/');
+    let websocket_base = if let Some(rest) = base.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = base.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else if base.starts_with("ws://") || base.starts_with("wss://") {
+        base.to_string()
+    } else {
+        return Err(anyhow!(
+            "SEMAPHORE_API_BASE_URL must start with http://, https://, ws://, or wss://"
+        ));
+    };
+    Ok(format!(
+        "{websocket_base}/api/sessions/{session_id}/bridge/events/ws"
+    ))
+}
+
 fn default_bridge_epoch(runtime_id: Uuid) -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -186,6 +223,80 @@ fn heartbeat_event(
     }
 }
 
+async fn send_bridge_event(
+    endpoint: &str,
+    bridge_token: &str,
+    event: &BridgeEventBody,
+    request_timeout_seconds: u64,
+) -> Result<BridgeSendResult> {
+    let ack = send_bridge_event_websocket(
+        endpoint,
+        bridge_token,
+        event,
+        Duration::from_secs(request_timeout_seconds),
+    )
+    .await?;
+    Ok(BridgeSendResult {
+        ack,
+        transport: "websocket",
+    })
+}
+
+async fn send_bridge_event_websocket(
+    endpoint: &str,
+    bridge_token: &str,
+    event: &BridgeEventBody,
+    timeout_duration: Duration,
+) -> Result<BridgeAck> {
+    let mut request = endpoint
+        .into_client_request()
+        .with_context(|| format!("invalid bridge websocket URL `{endpoint}`"))?;
+    let header_value = HeaderValue::from_str(&format!("Bearer {bridge_token}"))
+        .context("invalid bridge authorization header value")?;
+    request.headers_mut().insert(AUTHORIZATION, header_value);
+
+    ensure_rustls_crypto_provider();
+    let (mut websocket, _response) = tokio::time::timeout(timeout_duration, connect_async(request))
+        .await
+        .context("timed out connecting to bridge websocket")?
+        .context("failed to connect to bridge websocket")?;
+    let payload = serde_json::to_string(event).context("failed to encode bridge event")?;
+    tokio::time::timeout(
+        timeout_duration,
+        websocket.send(WebSocketMessage::Text(payload.into())),
+    )
+    .await
+    .context("timed out sending bridge event")?
+    .context("failed to send bridge event")?;
+
+    loop {
+        let message = tokio::time::timeout(timeout_duration, websocket.next())
+            .await
+            .context("timed out waiting for bridge ack")?
+            .ok_or_else(|| anyhow!("bridge websocket closed before ack"))?
+            .context("failed to read bridge ack")?;
+        match message {
+            WebSocketMessage::Text(text) => {
+                return serde_json::from_str(&text).context("bridge ack was not valid JSON");
+            }
+            WebSocketMessage::Binary(bytes) => {
+                return serde_json::from_slice(&bytes).context("bridge ack was not valid JSON");
+            }
+            WebSocketMessage::Ping(bytes) => {
+                websocket
+                    .send(WebSocketMessage::Pong(bytes))
+                    .await
+                    .context("failed to respond to bridge websocket ping")?;
+            }
+            WebSocketMessage::Pong(_) | WebSocketMessage::Frame(_) => {}
+            WebSocketMessage::Close(frame) => {
+                return Err(anyhow!("bridge websocket closed before ack: {frame:?}"));
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
 async fn post_bridge_event(
     client: &reqwest::Client,
     endpoint: &str,
@@ -211,7 +322,8 @@ async fn post_bridge_event(
     serde_json::from_str(&body).context("bridge ack was not valid JSON")
 }
 
-fn bridge_error_body(status: StatusCode, body: &str) -> String {
+#[allow(dead_code)]
+fn bridge_error_body(status: reqwest::StatusCode, body: &str) -> String {
     let fallback = status.canonical_reason().unwrap_or("request failed");
     let summary = body.trim();
     if summary.is_empty() {
@@ -224,6 +336,7 @@ fn bridge_error_body(status: StatusCode, body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;
+    use reqwest::StatusCode;
     use serde_json::json;
 
     use super::*;
@@ -246,6 +359,19 @@ mod tests {
             bridge_events_url("https://api.example.test/", session_id()),
             "https://api.example.test/api/sessions/11111111-1111-1111-1111-111111111111/bridge/events"
         );
+    }
+
+    #[test]
+    fn bridge_events_ws_url_converts_http_base_url() {
+        assert_eq!(
+            bridge_events_ws_url("https://api.example.test/", session_id()).unwrap(),
+            "wss://api.example.test/api/sessions/11111111-1111-1111-1111-111111111111/bridge/events/ws"
+        );
+        assert_eq!(
+            bridge_events_ws_url("http://localhost:8080", session_id()).unwrap(),
+            "ws://localhost:8080/api/sessions/11111111-1111-1111-1111-111111111111/bridge/events/ws"
+        );
+        assert!(bridge_events_ws_url("api.example.test", session_id()).is_err());
     }
 
     #[test]

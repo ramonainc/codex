@@ -11633,10 +11633,13 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "codex-utils-rustls-provider",
+ "futures",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-tungstenite",
  "uuid",
 ]
 
