@@ -1430,7 +1430,16 @@ fn summarize_thread_item(item: &Value) -> Value {
     copy_string_field(&mut summary, item, "source", "source", 80);
     copy_string_field(&mut summary, item, "cwd", "cwd", 512);
     copy_string_field(&mut summary, item, "path", "path", 512);
+    copy_string_field(&mut summary, item, "savedPath", "savedPath", 512);
     copy_string_field(&mut summary, item, "command", "commandPreview", 512);
+    insert_bounded_optional_string(
+        &mut summary,
+        item,
+        "revisedPrompt",
+        "revisedPromptPreview",
+        "revisedPromptPreviewTruncated",
+        1_024,
+    );
     insert_i64_field(&mut summary, item, "exitCode", "exitCode");
     insert_i64_field(&mut summary, item, "durationMs", "durationMs");
     if let Some(success) = item.get("success").and_then(Value::as_bool) {
@@ -1913,6 +1922,43 @@ mod tests {
         assert_eq!(summary["item"]["errorPresent"], true);
         assert!(summary["item"].get("aggregatedOutput").is_none());
         assert!(summary["item"].get("error").is_none());
+    }
+
+    #[test]
+    fn item_lifecycle_summary_keeps_image_reference_fields_without_raw_result() {
+        let summary = notification_payload_summary(&json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "imageGeneration",
+                    "id": "image-1",
+                    "status": "completed",
+                    "revisedPrompt": format!("{}{}", "paint ", "x".repeat(2_000)),
+                    "result": {"raw": "image bytes or remote payload"},
+                    "savedPath": "/home/daytona/workspace/.codex/images/generated.png"
+                }
+            }
+        }));
+
+        assert_eq!(summary["itemKind"], "imageGeneration");
+        assert_eq!(summary["itemStatus"], "completed");
+        assert_eq!(summary["item"]["id"], "image-1");
+        assert_eq!(
+            summary["item"]["savedPath"],
+            "/home/daytona/workspace/.codex/images/generated.png"
+        );
+        assert_eq!(
+            summary["item"]["revisedPromptPreview"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            1_024
+        );
+        assert_eq!(summary["item"]["revisedPromptPreviewTruncated"], true);
+        assert_eq!(summary["item"]["resultPresent"], true);
+        assert!(summary["item"].get("result").is_none());
+        assert!(summary["item"].get("revisedPrompt").is_none());
     }
 
     #[test]
