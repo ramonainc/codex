@@ -849,6 +849,9 @@ fn notification_payload_summary(value: &Value) -> Value {
                 if let Some(status) = item_summary.get("status").cloned() {
                     summary.insert("itemStatus".to_string(), status);
                 }
+                if let Some(outcome) = item_summary.get("outcome").cloned() {
+                    summary.insert("itemOutcome".to_string(), outcome);
+                }
                 summary.insert("item".to_string(), item_summary);
             }
         }
@@ -929,6 +932,9 @@ fn summarize_thread_item(item: &Value) -> Value {
     if let Some(changes) = item.get("changes").and_then(Value::as_array) {
         summary.insert("changeCount".to_string(), json!(changes.len()));
     }
+    if let Some(outcome) = thread_item_outcome(item) {
+        summary.insert("outcome".to_string(), json!(outcome));
+    }
     for key in [
         "arguments",
         "result",
@@ -941,6 +947,50 @@ fn summarize_thread_item(item: &Value) -> Value {
         }
     }
     Value::Object(summary)
+}
+
+fn thread_item_outcome(item: &Value) -> Option<&'static str> {
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .map(|value| value.to_ascii_lowercase());
+    if matches!(
+        status.as_deref(),
+        Some("failed" | "error" | "errored" | "timedout" | "timed_out")
+    ) || item.get("error").is_some()
+        || item.get("success").and_then(Value::as_bool) == Some(false)
+        || item
+            .get("exitCode")
+            .and_then(Value::as_i64)
+            .is_some_and(|exit_code| exit_code != 0)
+    {
+        return Some("failed");
+    }
+    if matches!(
+        status.as_deref(),
+        Some("declined" | "canceled" | "cancelled" | "interrupted" | "aborted")
+    ) {
+        return Some("canceled");
+    }
+    if matches!(status.as_deref(), Some("redacted")) {
+        return Some("redacted");
+    }
+    if matches!(
+        status.as_deref(),
+        Some("inprogress" | "in_progress" | "running" | "started" | "pending")
+    ) {
+        return Some("running");
+    }
+    if item.get("success").and_then(Value::as_bool) == Some(true)
+        || item.get("exitCode").and_then(Value::as_i64) == Some(0)
+        || matches!(
+            status.as_deref(),
+            Some("completed" | "succeeded" | "success")
+        )
+    {
+        return Some("success");
+    }
+    None
 }
 
 fn copy_string_field(
@@ -1264,13 +1314,48 @@ mod tests {
 
         assert_eq!(summary["itemKind"], "mcpToolCall");
         assert_eq!(summary["itemStatus"], "inProgress");
+        assert_eq!(summary["itemOutcome"], "running");
         assert_eq!(summary["item"]["id"], "item-1");
         assert_eq!(summary["item"]["server"], "github");
         assert_eq!(summary["item"]["tool"], "create_pr");
+        assert_eq!(summary["item"]["outcome"], "running");
         assert_eq!(summary["item"]["argumentsPresent"], true);
         assert_eq!(summary["item"]["resultPresent"], true);
         assert!(summary["item"].get("arguments").is_none());
         assert!(summary["item"].get("result").is_none());
+    }
+
+    #[test]
+    fn item_lifecycle_summary_marks_failed_commands_without_raw_output() {
+        let summary = notification_payload_summary(&json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "commandExecution",
+                    "id": "item-2",
+                    "command": "cargo test -p api",
+                    "cwd": "/workspace/project",
+                    "status": "completed",
+                    "exitCode": 101,
+                    "durationMs": 3200,
+                    "aggregatedOutput": "long raw test failure",
+                    "error": {"message": "tests failed"}
+                }
+            }
+        }));
+
+        assert_eq!(summary["itemKind"], "commandExecution");
+        assert_eq!(summary["itemStatus"], "completed");
+        assert_eq!(summary["itemOutcome"], "failed");
+        assert_eq!(summary["item"]["commandPreview"], "cargo test -p api");
+        assert_eq!(summary["item"]["cwd"], "/workspace/project");
+        assert_eq!(summary["item"]["exitCode"], 101);
+        assert_eq!(summary["item"]["durationMs"], 3200);
+        assert_eq!(summary["item"]["outcome"], "failed");
+        assert_eq!(summary["item"]["aggregatedOutputPresent"], true);
+        assert_eq!(summary["item"]["errorPresent"], true);
+        assert!(summary["item"].get("aggregatedOutput").is_none());
+        assert!(summary["item"].get("error").is_none());
     }
 
     #[test]
