@@ -99,6 +99,19 @@ struct BridgeCommand {
     payload: Value,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BridgeCommandPush {
+    #[serde(default)]
+    commands: Vec<BridgeCommand>,
+}
+
+#[derive(Debug)]
+enum BridgeServerMessage {
+    Ack(BridgeAck),
+    Commands(Vec<BridgeCommand>),
+}
+
 #[derive(Debug)]
 struct BridgeSendResult {
     ack: BridgeAck,
@@ -245,18 +258,66 @@ impl BridgeTransport {
         .context("timed out sending bridge event")?
         .context("failed to send bridge event")?;
 
+        let mut pushed_commands = Vec::new();
         loop {
-            let message = tokio::time::timeout(self.timeout_duration, websocket.next())
-                .await
-                .context("timed out waiting for bridge ack")?
-                .ok_or_else(|| anyhow!("bridge websocket closed before ack"))?
-                .context("failed to read bridge ack")?;
-            match message {
-                WebSocketMessage::Text(text) => {
-                    return serde_json::from_str(&text).context("bridge ack was not valid JSON");
+            match self
+                .read_server_message(Some(self.timeout_duration))
+                .await?
+            {
+                BridgeServerMessage::Ack(mut ack) => {
+                    if !pushed_commands.is_empty() {
+                        pushed_commands.extend(ack.commands);
+                        ack.commands = pushed_commands;
+                    }
+                    return Ok(ack);
                 }
+                BridgeServerMessage::Commands(commands) => {
+                    pushed_commands.extend(commands);
+                }
+            }
+        }
+    }
+
+    async fn read_pushed_commands(&mut self) -> Result<Vec<BridgeCommand>> {
+        self.ensure_connected().await?;
+        loop {
+            match self.read_server_message(None).await {
+                Ok(BridgeServerMessage::Commands(commands)) if !commands.is_empty() => {
+                    return Ok(commands);
+                }
+                Ok(BridgeServerMessage::Ack(ack)) if !ack.commands.is_empty() => {
+                    return Ok(ack.commands);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    self.websocket = None;
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    async fn read_server_message(
+        &mut self,
+        timeout_duration: Option<Duration>,
+    ) -> Result<BridgeServerMessage> {
+        let websocket = self
+            .websocket
+            .as_mut()
+            .ok_or_else(|| anyhow!("bridge websocket was not connected"))?;
+        loop {
+            let message = match timeout_duration {
+                Some(duration) => tokio::time::timeout(duration, websocket.next())
+                    .await
+                    .context("timed out waiting for bridge websocket message")?,
+                None => websocket.next().await,
+            }
+            .ok_or_else(|| anyhow!("bridge websocket closed before message"))?
+            .context("failed to read bridge websocket message")?;
+            match message {
+                WebSocketMessage::Text(text) => return decode_bridge_server_message_text(&text),
                 WebSocketMessage::Binary(bytes) => {
-                    return serde_json::from_slice(&bytes).context("bridge ack was not valid JSON");
+                    return decode_bridge_server_message_bytes(&bytes);
                 }
                 WebSocketMessage::Ping(bytes) => {
                     websocket
@@ -266,7 +327,7 @@ impl BridgeTransport {
                 }
                 WebSocketMessage::Pong(_) | WebSocketMessage::Frame(_) => {}
                 WebSocketMessage::Close(frame) => {
-                    return Err(anyhow!("bridge websocket closed before ack: {frame:?}"));
+                    return Err(anyhow!("bridge websocket closed before message: {frame:?}"));
                 }
             }
         }
@@ -296,6 +357,32 @@ impl BridgeTransport {
     }
 }
 
+fn decode_bridge_server_message_text(text: &str) -> Result<BridgeServerMessage> {
+    let value = serde_json::from_str::<Value>(text).context("bridge message was not valid JSON")?;
+    decode_bridge_server_message_value(value)
+}
+
+fn decode_bridge_server_message_bytes(bytes: &[u8]) -> Result<BridgeServerMessage> {
+    let value =
+        serde_json::from_slice::<Value>(bytes).context("bridge message was not valid JSON")?;
+    decode_bridge_server_message_value(value)
+}
+
+fn decode_bridge_server_message_value(value: Value) -> Result<BridgeServerMessage> {
+    if value
+        .get("messageType")
+        .and_then(Value::as_str)
+        .is_some_and(|message_type| message_type == "commands")
+    {
+        let push = serde_json::from_value::<BridgeCommandPush>(value)
+            .context("bridge command push was not valid JSON")?;
+        return Ok(BridgeServerMessage::Commands(push.commands));
+    }
+    let ack =
+        serde_json::from_value::<BridgeAck>(value).context("bridge ack was not valid JSON")?;
+    Ok(BridgeServerMessage::Ack(ack))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -323,20 +410,15 @@ async fn main() -> Result<()> {
         match replay_spooled_events(&args, &mut transport, &mut spool).await {
             Ok(commands) => {
                 if args.drain_commands {
-                    for command in commands {
-                        if let Err(error) = handle_bridge_command(
-                            &args,
-                            &mut transport,
-                            &mut spool,
-                            &bridge_epoch,
-                            &mut sequence,
-                            command,
-                        )
-                        .await
-                        {
-                            eprintln!("Sandbox bridge command failed: {error:#}");
-                        }
-                    }
+                    handle_bridge_commands(
+                        &args,
+                        &mut transport,
+                        &mut spool,
+                        &bridge_epoch,
+                        &mut sequence,
+                        commands,
+                    )
+                    .await;
                 }
             }
             Err(error) => eprintln!("Sandbox bridge spool replay failed: {error:#}"),
@@ -369,20 +451,15 @@ async fn main() -> Result<()> {
                 );
                 let commands = result.ack.commands.clone();
                 if args.drain_commands {
-                    for command in commands {
-                        if let Err(error) = handle_bridge_command(
-                            &args,
-                            &mut transport,
-                            &mut spool,
-                            &bridge_epoch,
-                            &mut sequence,
-                            command,
-                        )
-                        .await
-                        {
-                            eprintln!("Sandbox bridge command failed: {error:#}");
-                        }
-                    }
+                    handle_bridge_commands(
+                        &args,
+                        &mut transport,
+                        &mut spool,
+                        &bridge_epoch,
+                        &mut sequence,
+                        commands,
+                    )
+                    .await;
                 }
                 if args.once {
                     return Ok(());
@@ -399,6 +476,22 @@ async fn main() -> Result<()> {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => return Ok(()),
             _ = tokio::time::sleep(Duration::from_secs(args.heartbeat_seconds)) => {}
+            commands = transport.read_pushed_commands(), if args.drain_commands => {
+                match commands {
+                    Ok(commands) => {
+                        handle_bridge_commands(
+                            &args,
+                            &mut transport,
+                            &mut spool,
+                            &bridge_epoch,
+                            &mut sequence,
+                            commands,
+                        )
+                        .await;
+                    }
+                    Err(error) => eprintln!("Sandbox bridge command push read failed: {error:#}"),
+                }
+            }
         }
     }
 }
@@ -605,6 +698,23 @@ async fn replay_spooled_events(
         spool.remove_front()?;
     }
     Ok(commands)
+}
+
+async fn handle_bridge_commands(
+    args: &Args,
+    transport: &mut BridgeTransport,
+    spool: &mut EventSpool,
+    bridge_epoch: &str,
+    sequence: &mut i64,
+    commands: Vec<BridgeCommand>,
+) {
+    for command in commands {
+        if let Err(error) =
+            handle_bridge_command(args, transport, spool, bridge_epoch, sequence, command).await
+        {
+            eprintln!("Sandbox bridge command failed: {error:#}");
+        }
+    }
 }
 
 async fn handle_bridge_command(
@@ -989,6 +1099,24 @@ mod tests {
             .expect("send bridge ack");
     }
 
+    async fn send_bridge_command_push(websocket: &mut WebSocketStream<TcpStream>) {
+        websocket
+            .send(WebSocketMessage::Text(
+                json!({
+                    "messageType": "commands",
+                    "commands": [{
+                        "id": "33333333-3333-3333-3333-333333333333",
+                        "commandType": "turn.start",
+                        "payload": { "productTurnId": "turn-1" },
+                    }],
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send bridge command push");
+    }
+
     #[test]
     fn bridge_events_url_trims_base_url() {
         assert_eq!(
@@ -1070,6 +1198,25 @@ mod tests {
 
         assert_eq!(result["response"], "done");
         assert_eq!(result["threadId"], "thread-1");
+    }
+
+    #[test]
+    fn bridge_server_message_decoder_reads_command_pushes() {
+        let message = decode_bridge_server_message_value(json!({
+            "messageType": "commands",
+            "commands": [{
+                "id": "33333333-3333-3333-3333-333333333333",
+                "commandType": "turn.start",
+                "payload": { "productTurnId": "turn-1" },
+            }],
+        }))
+        .unwrap();
+
+        let BridgeServerMessage::Commands(commands) = message else {
+            panic!("expected command push");
+        };
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].command_type, "turn.start");
     }
 
     #[test]
@@ -1168,6 +1315,56 @@ mod tests {
         assert_eq!(first.ack.acknowledged_sequence, 1);
         assert_eq!(second.ack.acknowledged_sequence, 2);
         assert_eq!(server.await.unwrap(), vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn bridge_transport_merges_command_push_received_before_ack() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind bridge test listener");
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut websocket = accept_bridge_websocket(&listener).await;
+            let event = read_bridge_event(&mut websocket).await;
+            send_bridge_command_push(&mut websocket).await;
+            send_bridge_ack(&mut websocket, event.sequence).await;
+        });
+        let mut transport =
+            BridgeTransport::new(endpoint, "bridge-token".to_string(), Duration::from_secs(2));
+
+        let result = transport
+            .send_event(&test_event(1, "heartbeat"))
+            .await
+            .unwrap();
+
+        assert_eq!(result.ack.acknowledged_sequence, 1);
+        assert_eq!(result.ack.commands.len(), 1);
+        assert_eq!(result.ack.commands[0].command_type, "turn.start");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bridge_transport_reads_idle_command_pushes() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind bridge test listener");
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut websocket = accept_bridge_websocket(&listener).await;
+            send_bridge_command_push(&mut websocket).await;
+        });
+        let mut transport =
+            BridgeTransport::new(endpoint, "bridge-token".to_string(), Duration::from_secs(2));
+
+        let commands =
+            tokio::time::timeout(Duration::from_secs(2), transport.read_pushed_commands())
+                .await
+                .expect("read command push timed out")
+                .unwrap();
+
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].command_type, "turn.start");
+        server.await.unwrap();
     }
 
     #[tokio::test]
