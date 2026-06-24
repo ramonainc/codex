@@ -736,6 +736,10 @@ fn notification_payload_summary(value: &Value) -> Value {
     let Some(params) = value.get("params") else {
         return json!({});
     };
+    let method = value
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let mut summary = serde_json::Map::new();
     for key in [
         "status",
@@ -755,14 +759,205 @@ fn notification_payload_summary(value: &Value) -> Value {
             summary.insert(key.to_string(), json!(value));
         }
     }
-    if value.get("method").and_then(Value::as_str) == Some("item/agentMessage/delta")
-        && let Some(delta) = params.get("delta").and_then(Value::as_str)
-    {
-        let (delta, truncated) = bounded_text(delta, 4_096);
-        summary.insert("assistantTextDelta".to_string(), json!(delta));
-        summary.insert("assistantTextDeltaTruncated".to_string(), json!(truncated));
+    match method {
+        "item/agentMessage/delta" => {
+            insert_bounded_text_summary(
+                &mut summary,
+                params,
+                "delta",
+                "assistantTextDelta",
+                "assistantTextDeltaTruncated",
+                4_096,
+            );
+        }
+        "item/plan/delta" => {
+            insert_bounded_text_summary(
+                &mut summary,
+                params,
+                "delta",
+                "planTextDelta",
+                "planTextDeltaTruncated",
+                4_096,
+            );
+        }
+        "item/reasoning/summaryTextDelta" => {
+            insert_bounded_text_summary(
+                &mut summary,
+                params,
+                "delta",
+                "reasoningSummaryTextDelta",
+                "reasoningSummaryTextDeltaTruncated",
+                4_096,
+            );
+            insert_i64_field(&mut summary, params, "summaryIndex", "summaryIndex");
+        }
+        "item/reasoning/textDelta" => {
+            insert_bounded_text_summary(
+                &mut summary,
+                params,
+                "delta",
+                "reasoningTextDelta",
+                "reasoningTextDeltaTruncated",
+                4_096,
+            );
+            insert_i64_field(&mut summary, params, "contentIndex", "contentIndex");
+        }
+        "item/reasoning/summaryPartAdded" => {
+            insert_i64_field(&mut summary, params, "summaryIndex", "summaryIndex");
+        }
+        "item/commandExecution/outputDelta" => {
+            insert_bounded_text_summary(
+                &mut summary,
+                params,
+                "delta",
+                "commandOutputDelta",
+                "commandOutputDeltaTruncated",
+                4_096,
+            );
+        }
+        "item/mcpToolCall/progress" => {
+            insert_bounded_text_summary(
+                &mut summary,
+                params,
+                "message",
+                "progressMessage",
+                "progressMessageTruncated",
+                1_024,
+            );
+        }
+        "item/fileChange/patchUpdated" => {
+            if let Some(changes) = params.get("changes").and_then(Value::as_array) {
+                summary.insert("changeCount".to_string(), json!(changes.len()));
+            }
+        }
+        "turn/plan/updated" => {
+            if let Some(explanation) = params.get("explanation").and_then(Value::as_str) {
+                let (value, truncated) = bounded_text(explanation, 2_048);
+                summary.insert("explanation".to_string(), json!(value));
+                summary.insert("explanationTruncated".to_string(), json!(truncated));
+            }
+            if let Some(plan) = summarize_plan_steps(params.get("plan")) {
+                summary.insert("plan".to_string(), plan);
+            }
+        }
+        "item/started" | "item/completed" => {
+            if let Some(item) = params.get("item") {
+                let item_summary = summarize_thread_item(item);
+                if let Some(kind) = item_summary.get("kind").cloned() {
+                    summary.insert("itemKind".to_string(), kind);
+                }
+                if let Some(status) = item_summary.get("status").cloned() {
+                    summary.insert("itemStatus".to_string(), status);
+                }
+                summary.insert("item".to_string(), item_summary);
+            }
+        }
+        _ => {}
     }
     Value::Object(summary)
+}
+
+fn insert_bounded_text_summary(
+    summary: &mut serde_json::Map<String, Value>,
+    params: &Value,
+    source_key: &str,
+    value_key: &str,
+    truncated_key: &str,
+    max_chars: usize,
+) {
+    let Some(value) = params.get(source_key).and_then(Value::as_str) else {
+        return;
+    };
+    let (value, truncated) = bounded_text(value, max_chars);
+    summary.insert(value_key.to_string(), json!(value));
+    summary.insert(truncated_key.to_string(), json!(truncated));
+}
+
+fn insert_i64_field(
+    summary: &mut serde_json::Map<String, Value>,
+    value: &Value,
+    source_key: &str,
+    output_key: &str,
+) {
+    if let Some(number) = value.get(source_key).and_then(Value::as_i64) {
+        summary.insert(output_key.to_string(), json!(number));
+    }
+}
+
+fn summarize_plan_steps(value: Option<&Value>) -> Option<Value> {
+    let steps = value?.as_array()?;
+    let steps = steps
+        .iter()
+        .take(20)
+        .map(|step| {
+            let mut summary = serde_json::Map::new();
+            if let Some(text) = step.get("step").and_then(Value::as_str) {
+                let (text, truncated) = bounded_text(text, 512);
+                summary.insert("step".to_string(), json!(text));
+                summary.insert("stepTruncated".to_string(), json!(truncated));
+            }
+            if let Some(status) = step.get("status").and_then(Value::as_str) {
+                summary.insert("status".to_string(), json!(status));
+            }
+            Value::Object(summary)
+        })
+        .collect::<Vec<_>>();
+    Some(json!({
+        "steps": steps,
+        "totalCount": value.and_then(Value::as_array).map_or(0, Vec::len),
+        "truncated": value.and_then(Value::as_array).is_some_and(|value| value.len() > 20),
+    }))
+}
+
+fn summarize_thread_item(item: &Value) -> Value {
+    let mut summary = serde_json::Map::new();
+    copy_string_field(&mut summary, item, "type", "kind", 80);
+    copy_string_field(&mut summary, item, "id", "id", 160);
+    copy_string_field(&mut summary, item, "status", "status", 80);
+    copy_string_field(&mut summary, item, "server", "server", 160);
+    copy_string_field(&mut summary, item, "tool", "tool", 160);
+    copy_string_field(&mut summary, item, "namespace", "namespace", 160);
+    copy_string_field(&mut summary, item, "source", "source", 80);
+    copy_string_field(&mut summary, item, "cwd", "cwd", 512);
+    copy_string_field(&mut summary, item, "path", "path", 512);
+    copy_string_field(&mut summary, item, "command", "commandPreview", 512);
+    insert_i64_field(&mut summary, item, "exitCode", "exitCode");
+    insert_i64_field(&mut summary, item, "durationMs", "durationMs");
+    if let Some(success) = item.get("success").and_then(Value::as_bool) {
+        summary.insert("success".to_string(), json!(success));
+    }
+    if let Some(changes) = item.get("changes").and_then(Value::as_array) {
+        summary.insert("changeCount".to_string(), json!(changes.len()));
+    }
+    for key in [
+        "arguments",
+        "result",
+        "error",
+        "aggregatedOutput",
+        "contentItems",
+    ] {
+        if item.get(key).is_some() {
+            summary.insert(format!("{key}Present"), json!(true));
+        }
+    }
+    Value::Object(summary)
+}
+
+fn copy_string_field(
+    summary: &mut serde_json::Map<String, Value>,
+    value: &Value,
+    source_key: &str,
+    output_key: &str,
+    max_chars: usize,
+) {
+    let Some(text) = value.get(source_key).and_then(Value::as_str) else {
+        return;
+    };
+    let (text, truncated) = bounded_text(text, max_chars);
+    summary.insert(output_key.to_string(), json!(text));
+    if truncated {
+        summary.insert(format!("{output_key}Truncated"), json!(true));
+    }
 }
 
 fn bounded_text(value: &str, max_chars: usize) -> (String, bool) {
@@ -1051,6 +1246,81 @@ mod tests {
     }
 
     #[test]
+    fn item_lifecycle_summary_keeps_safe_tool_shape_without_raw_arguments() {
+        let summary = notification_payload_summary(&json!({
+            "method": "item/started",
+            "params": {
+                "item": {
+                    "type": "mcpToolCall",
+                    "id": "item-1",
+                    "server": "github",
+                    "tool": "create_pr",
+                    "status": "inProgress",
+                    "arguments": {"token": "secret", "title": "ship it"},
+                    "result": {"body": "large raw result"}
+                }
+            }
+        }));
+
+        assert_eq!(summary["itemKind"], "mcpToolCall");
+        assert_eq!(summary["itemStatus"], "inProgress");
+        assert_eq!(summary["item"]["id"], "item-1");
+        assert_eq!(summary["item"]["server"], "github");
+        assert_eq!(summary["item"]["tool"], "create_pr");
+        assert_eq!(summary["item"]["argumentsPresent"], true);
+        assert_eq!(summary["item"]["resultPresent"], true);
+        assert!(summary["item"].get("arguments").is_none());
+        assert!(summary["item"].get("result").is_none());
+    }
+
+    #[test]
+    fn plan_and_reasoning_summaries_are_bounded() {
+        let plan_summary = notification_payload_summary(&json!({
+            "method": "turn/plan/updated",
+            "params": {
+                "explanation": "x".repeat(2_100),
+                "plan": [
+                    {"step": "inspect bridge", "status": "completed"},
+                    {"step": "wire events", "status": "inProgress"}
+                ]
+            }
+        }));
+        assert_eq!(
+            plan_summary["explanation"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            2_048
+        );
+        assert_eq!(plan_summary["explanationTruncated"], true);
+        assert_eq!(plan_summary["plan"]["steps"][0]["step"], "inspect bridge");
+        assert_eq!(plan_summary["plan"]["steps"][1]["status"], "inProgress");
+
+        let reasoning_summary = notification_payload_summary(&json!({
+            "method": "item/reasoning/summaryTextDelta",
+            "params": {
+                "itemId": "reasoning-1",
+                "summaryIndex": 2,
+                "delta": "r".repeat(4_100)
+            }
+        }));
+        assert_eq!(
+            reasoning_summary["reasoningSummaryTextDelta"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            4_096
+        );
+        assert_eq!(
+            reasoning_summary["reasoningSummaryTextDeltaTruncated"],
+            true
+        );
+        assert_eq!(reasoning_summary["summaryIndex"], 2);
+    }
+
+    #[test]
     fn turn_started_notification_bridge_payload_extracts_nested_turn_id() {
         let notification = ServerNotification::TurnStarted(TurnStartedNotification {
             thread_id: "thread-1".to_string(),
@@ -1075,7 +1345,7 @@ mod tests {
     }
 
     #[test]
-    fn command_output_notification_maps_to_command_output_without_delta() {
+    fn command_output_notification_maps_to_command_output_with_bounded_summary() {
         let notification = ServerNotification::CommandExecutionOutputDelta(
             CommandExecutionOutputDeltaNotification {
                 thread_id: "thread-1".to_string(),
@@ -1096,7 +1366,15 @@ mod tests {
             "item/commandExecution/outputDelta"
         );
         assert_eq!(payload["itemId"], "command-1");
-        assert!(!payload.to_string().contains("raw command output"));
+        assert_eq!(
+            payload["payloadSummary"]["commandOutputDelta"],
+            "raw command output"
+        );
+        assert_eq!(
+            payload["payloadSummary"]["commandOutputDeltaTruncated"],
+            false
+        );
+        assert!(payload.get("delta").is_none());
     }
 
     #[test]
