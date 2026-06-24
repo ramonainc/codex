@@ -104,6 +104,7 @@ struct TurnResult {
     thread_id: String,
     codex_session_id: String,
     turn_id: String,
+    assistant_item_id: Option<String>,
     model: String,
     workspace_dir: Option<String>,
     server_version: Option<String>,
@@ -132,6 +133,7 @@ struct ControlResult {
 struct TurnAccumulator {
     response_delta: String,
     completed_agent_message: Option<String>,
+    assistant_item_id: Option<String>,
     event_count: u64,
     assistant_delta_count: u64,
     item_completed_count: u64,
@@ -301,6 +303,7 @@ async fn run_turn(command: TurnCommand) -> Result<()> {
         thread_id: thread.thread.id.clone(),
         codex_session_id: thread.thread.session_id.clone(),
         turn_id: turn.turn.id.clone(),
+        assistant_item_id: accumulator.assistant_item_id,
         model: command.model,
         workspace_dir: cwd_string,
         server_version,
@@ -752,7 +755,21 @@ fn notification_payload_summary(value: &Value) -> Value {
             summary.insert(key.to_string(), json!(value));
         }
     }
+    if value.get("method").and_then(Value::as_str) == Some("item/agentMessage/delta")
+        && let Some(delta) = params.get("delta").and_then(Value::as_str)
+    {
+        let (delta, truncated) = bounded_text(delta, 4_096);
+        summary.insert("assistantTextDelta".to_string(), json!(delta));
+        summary.insert("assistantTextDeltaTruncated".to_string(), json!(truncated));
+    }
     Value::Object(summary)
+}
+
+fn bounded_text(value: &str, max_chars: usize) -> (String, bool) {
+    let mut chars = value.chars();
+    let text = chars.by_ref().take(max_chars).collect::<String>();
+    let truncated = chars.next().is_some();
+    (text, truncated)
 }
 
 fn bridge_error_body(body: &str) -> String {
@@ -775,13 +792,15 @@ fn handle_notification(
             if notification_matches(&notification, thread_id, turn_id) =>
         {
             accumulator.assistant_delta_count += 1;
+            accumulator.assistant_item_id = Some(notification.item_id.clone());
             accumulator.response_delta.push_str(&notification.delta);
         }
         ServerNotification::ItemCompleted(notification)
             if notification.thread_id == thread_id && notification.turn_id == turn_id =>
         {
             accumulator.item_completed_count += 1;
-            if let ThreadItem::AgentMessage { text, .. } = notification.item {
+            if let ThreadItem::AgentMessage { id, text, .. } = notification.item {
+                accumulator.assistant_item_id = Some(id);
                 accumulator.completed_agent_message = Some(text);
             }
         }
@@ -789,7 +808,8 @@ fn handle_notification(
             if notification.thread_id == thread_id && notification.turn.id == turn_id =>
         {
             for item in notification.turn.items {
-                if let ThreadItem::AgentMessage { text, .. } = item {
+                if let ThreadItem::AgentMessage { id, text, .. } = item {
+                    accumulator.assistant_item_id = Some(id);
                     accumulator.completed_agent_message = Some(text);
                 }
             }
@@ -986,8 +1006,8 @@ mod tests {
     }
 
     #[test]
-    fn notification_bridge_payload_keeps_ids_without_raw_text_delta() {
-        let notification = agent_delta("secret-looking assistant delta");
+    fn notification_bridge_payload_keeps_ids_with_bounded_assistant_delta_summary() {
+        let notification = agent_delta("assistant delta");
 
         let payload = notification_bridge_payload(&notification, Some("product-turn-1"), 7);
 
@@ -999,10 +1019,34 @@ mod tests {
         assert_eq!(payload["turnId"], "turn-1");
         assert_eq!(payload["itemId"], "item-1");
         assert_eq!(payload["eventCount"], 7);
-        assert!(
-            !payload
-                .to_string()
-                .contains("secret-looking assistant delta")
+        assert_eq!(
+            payload["payloadSummary"]["assistantTextDelta"],
+            "assistant delta"
+        );
+        assert_eq!(
+            payload["payloadSummary"]["assistantTextDeltaTruncated"],
+            false
+        );
+        assert!(payload.get("delta").is_none());
+    }
+
+    #[test]
+    fn assistant_delta_summary_is_bounded() {
+        let notification = agent_delta(&"x".repeat(4_100));
+
+        let payload = notification_bridge_payload(&notification, Some("product-turn-1"), 7);
+
+        assert_eq!(
+            payload["payloadSummary"]["assistantTextDelta"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            4_096
+        );
+        assert_eq!(
+            payload["payloadSummary"]["assistantTextDeltaTruncated"],
+            true
         );
     }
 

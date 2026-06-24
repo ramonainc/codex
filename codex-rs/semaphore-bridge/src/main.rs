@@ -782,6 +782,7 @@ async fn handle_bridge_command(
                         "threadId": result.get("threadId").cloned().unwrap_or(Value::Null),
                         "codexSessionId": result.get("codexSessionId").cloned().unwrap_or(Value::Null),
                         "codexTurnId": result.get("turnId").cloned().unwrap_or(Value::Null),
+                        "codexItemId": result.get("assistantItemId").cloned().unwrap_or(Value::Null),
                         "model": result.get("model").cloned().unwrap_or(Value::Null),
                         "result": result,
                     }),
