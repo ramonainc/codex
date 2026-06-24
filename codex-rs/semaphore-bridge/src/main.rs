@@ -13,6 +13,9 @@ use futures::SinkExt;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::net::TcpStream;
+use tokio_tungstenite::MaybeTlsStream;
+use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -100,6 +103,13 @@ struct BridgeCommand {
 struct BridgeSendResult {
     ack: BridgeAck,
     transport: &'static str,
+}
+
+struct BridgeTransport {
+    endpoint: String,
+    bridge_token: String,
+    timeout_duration: Duration,
+    websocket: Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,
 }
 
 struct EventSpool {
@@ -191,12 +201,112 @@ impl EventSpool {
     }
 }
 
+impl BridgeTransport {
+    fn new(endpoint: String, bridge_token: String, timeout_duration: Duration) -> Self {
+        Self {
+            endpoint,
+            bridge_token,
+            timeout_duration,
+            websocket: None,
+        }
+    }
+
+    async fn send_event(&mut self, event: &BridgeEventBody) -> Result<BridgeSendResult> {
+        let mut last_error = None;
+        for _ in 0..2 {
+            match self.send_event_once(event).await {
+                Ok(ack) => {
+                    return Ok(BridgeSendResult {
+                        ack,
+                        transport: "websocket:persistent",
+                    });
+                }
+                Err(error) => {
+                    self.websocket = None;
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("failed to send bridge event")))
+    }
+
+    async fn send_event_once(&mut self, event: &BridgeEventBody) -> Result<BridgeAck> {
+        self.ensure_connected().await?;
+        let websocket = self
+            .websocket
+            .as_mut()
+            .ok_or_else(|| anyhow!("bridge websocket was not connected"))?;
+        let payload = serde_json::to_string(event).context("failed to encode bridge event")?;
+        tokio::time::timeout(
+            self.timeout_duration,
+            websocket.send(WebSocketMessage::Text(payload.into())),
+        )
+        .await
+        .context("timed out sending bridge event")?
+        .context("failed to send bridge event")?;
+
+        loop {
+            let message = tokio::time::timeout(self.timeout_duration, websocket.next())
+                .await
+                .context("timed out waiting for bridge ack")?
+                .ok_or_else(|| anyhow!("bridge websocket closed before ack"))?
+                .context("failed to read bridge ack")?;
+            match message {
+                WebSocketMessage::Text(text) => {
+                    return serde_json::from_str(&text).context("bridge ack was not valid JSON");
+                }
+                WebSocketMessage::Binary(bytes) => {
+                    return serde_json::from_slice(&bytes).context("bridge ack was not valid JSON");
+                }
+                WebSocketMessage::Ping(bytes) => {
+                    websocket
+                        .send(WebSocketMessage::Pong(bytes))
+                        .await
+                        .context("failed to respond to bridge websocket ping")?;
+                }
+                WebSocketMessage::Pong(_) | WebSocketMessage::Frame(_) => {}
+                WebSocketMessage::Close(frame) => {
+                    return Err(anyhow!("bridge websocket closed before ack: {frame:?}"));
+                }
+            }
+        }
+    }
+
+    async fn ensure_connected(&mut self) -> Result<()> {
+        if self.websocket.is_some() {
+            return Ok(());
+        }
+        let mut request = self
+            .endpoint
+            .as_str()
+            .into_client_request()
+            .with_context(|| format!("invalid bridge websocket URL `{}`", self.endpoint))?;
+        let header_value = HeaderValue::from_str(&format!("Bearer {}", self.bridge_token))
+            .context("invalid bridge authorization header value")?;
+        request.headers_mut().insert(AUTHORIZATION, header_value);
+
+        ensure_rustls_crypto_provider();
+        let (websocket, _response) =
+            tokio::time::timeout(self.timeout_duration, connect_async(request))
+                .await
+                .context("timed out connecting to bridge websocket")?
+                .context("failed to connect to bridge websocket")?;
+        self.websocket = Some(websocket);
+        Ok(())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
 
     let endpoint = bridge_events_ws_url(&args.api_base_url, args.session_id)?;
+    let mut transport = BridgeTransport::new(
+        endpoint,
+        args.bridge_token.clone(),
+        Duration::from_secs(args.request_timeout_seconds),
+    );
     let bridge_epoch = args
         .bridge_epoch
         .clone()
@@ -210,13 +320,13 @@ async fn main() -> Result<()> {
 
     let mut sequence = (spool.max_sequence() + 1).max(1);
     loop {
-        match replay_spooled_events(&args, &endpoint, &mut spool).await {
+        match replay_spooled_events(&args, &mut transport, &mut spool).await {
             Ok(commands) => {
                 if args.drain_commands {
                     for command in commands {
                         if let Err(error) = handle_bridge_command(
                             &args,
-                            &endpoint,
+                            &mut transport,
                             &mut spool,
                             &bridge_epoch,
                             &mut sequence,
@@ -242,16 +352,7 @@ async fn main() -> Result<()> {
         );
         let current_sequence = sequence;
         sequence += 1;
-        match send_or_spool_event(
-            &endpoint,
-            &args.bridge_token,
-            &mut spool,
-            &event,
-            args.request_timeout_seconds,
-            true,
-        )
-        .await
-        {
+        match send_or_spool_event(&mut transport, &mut spool, &event, true).await {
             Ok(result) => {
                 println!(
                     "SEMAPHORE_SANDBOX_BRIDGE_ACK_V1 sequence={} acknowledgedSequence={} duplicate={} accepted={} productEventId={} transport={}",
@@ -271,7 +372,7 @@ async fn main() -> Result<()> {
                     for command in commands {
                         if let Err(error) = handle_bridge_command(
                             &args,
-                            &endpoint,
+                            &mut transport,
                             &mut spool,
                             &bridge_epoch,
                             &mut sequence,
@@ -425,30 +526,16 @@ fn bridge_event(
 }
 
 async fn send_bridge_event(
-    endpoint: &str,
-    bridge_token: &str,
+    transport: &mut BridgeTransport,
     event: &BridgeEventBody,
-    request_timeout_seconds: u64,
 ) -> Result<BridgeSendResult> {
-    let ack = send_bridge_event_websocket(
-        endpoint,
-        bridge_token,
-        event,
-        Duration::from_secs(request_timeout_seconds),
-    )
-    .await?;
-    Ok(BridgeSendResult {
-        ack,
-        transport: "websocket",
-    })
+    transport.send_event(event).await
 }
 
 async fn send_or_spool_event(
-    endpoint: &str,
-    bridge_token: &str,
+    transport: &mut BridgeTransport,
     spool: &mut EventSpool,
     event: &BridgeEventBody,
-    request_timeout_seconds: u64,
     spool_on_failure: bool,
 ) -> Result<BridgeSendResult> {
     if !spool.is_empty() {
@@ -466,7 +553,7 @@ async fn send_or_spool_event(
             event.sequence
         ));
     }
-    match send_bridge_event(endpoint, bridge_token, event, request_timeout_seconds).await {
+    match send_bridge_event(transport, event).await {
         Ok(result) => Ok(result),
         Err(error) => {
             if spool_on_failure {
@@ -486,24 +573,19 @@ async fn send_or_spool_event(
 
 async fn replay_spooled_events(
     args: &Args,
-    endpoint: &str,
+    transport: &mut BridgeTransport,
     spool: &mut EventSpool,
 ) -> Result<Vec<BridgeCommand>> {
     let mut commands = Vec::new();
     while let Some(event) = spool.front().cloned() {
-        let result = send_bridge_event(
-            endpoint,
-            &args.bridge_token,
-            &event,
-            args.request_timeout_seconds,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "failed to replay bridge event {}:{} from spool",
-                event.bridge_epoch, event.sequence
-            )
-        })?;
+        let result = send_bridge_event(transport, &event)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to replay bridge event {}:{} from spool",
+                    event.bridge_epoch, event.sequence
+                )
+            })?;
         println!(
             "SEMAPHORE_SANDBOX_BRIDGE_REPLAY_ACK_V1 sequence={} acknowledgedSequence={} duplicate={} accepted={} productEventId={} transport={}",
             event.sequence,
@@ -525,63 +607,9 @@ async fn replay_spooled_events(
     Ok(commands)
 }
 
-async fn send_bridge_event_websocket(
-    endpoint: &str,
-    bridge_token: &str,
-    event: &BridgeEventBody,
-    timeout_duration: Duration,
-) -> Result<BridgeAck> {
-    let mut request = endpoint
-        .into_client_request()
-        .with_context(|| format!("invalid bridge websocket URL `{endpoint}`"))?;
-    let header_value = HeaderValue::from_str(&format!("Bearer {bridge_token}"))
-        .context("invalid bridge authorization header value")?;
-    request.headers_mut().insert(AUTHORIZATION, header_value);
-
-    ensure_rustls_crypto_provider();
-    let (mut websocket, _response) = tokio::time::timeout(timeout_duration, connect_async(request))
-        .await
-        .context("timed out connecting to bridge websocket")?
-        .context("failed to connect to bridge websocket")?;
-    let payload = serde_json::to_string(event).context("failed to encode bridge event")?;
-    tokio::time::timeout(
-        timeout_duration,
-        websocket.send(WebSocketMessage::Text(payload.into())),
-    )
-    .await
-    .context("timed out sending bridge event")?
-    .context("failed to send bridge event")?;
-
-    loop {
-        let message = tokio::time::timeout(timeout_duration, websocket.next())
-            .await
-            .context("timed out waiting for bridge ack")?
-            .ok_or_else(|| anyhow!("bridge websocket closed before ack"))?
-            .context("failed to read bridge ack")?;
-        match message {
-            WebSocketMessage::Text(text) => {
-                return serde_json::from_str(&text).context("bridge ack was not valid JSON");
-            }
-            WebSocketMessage::Binary(bytes) => {
-                return serde_json::from_slice(&bytes).context("bridge ack was not valid JSON");
-            }
-            WebSocketMessage::Ping(bytes) => {
-                websocket
-                    .send(WebSocketMessage::Pong(bytes))
-                    .await
-                    .context("failed to respond to bridge websocket ping")?;
-            }
-            WebSocketMessage::Pong(_) | WebSocketMessage::Frame(_) => {}
-            WebSocketMessage::Close(frame) => {
-                return Err(anyhow!("bridge websocket closed before ack: {frame:?}"));
-            }
-        }
-    }
-}
-
 async fn handle_bridge_command(
     args: &Args,
-    endpoint: &str,
+    transport: &mut BridgeTransport,
     spool: &mut EventSpool,
     bridge_epoch: &str,
     sequence: &mut i64,
@@ -589,7 +617,7 @@ async fn handle_bridge_command(
 ) -> Result<()> {
     send_bridge_status_event(
         args,
-        endpoint,
+        transport,
         spool,
         bridge_epoch,
         sequence,
@@ -612,7 +640,7 @@ async fn handle_bridge_command(
                     .context("turn.start command is missing productTurnId")?;
                 send_bridge_status_event(
                     args,
-                    endpoint,
+                    transport,
                     spool,
                     bridge_epoch,
                     sequence,
@@ -638,7 +666,7 @@ async fn handle_bridge_command(
                 let product_turn_id = command_payload_string(&command, "productTurnId");
                 send_bridge_status_event(
                     args,
-                    endpoint,
+                    transport,
                     spool,
                     bridge_epoch,
                     sequence,
@@ -659,7 +687,7 @@ async fn handle_bridge_command(
         other => {
             send_bridge_status_event(
                 args,
-                endpoint,
+                transport,
                 spool,
                 bridge_epoch,
                 sequence,
@@ -680,7 +708,7 @@ async fn handle_bridge_command(
 
 async fn send_bridge_status_event(
     args: &Args,
-    endpoint: &str,
+    transport: &mut BridgeTransport,
     spool: &mut EventSpool,
     bridge_epoch: &str,
     sequence: &mut i64,
@@ -699,15 +727,7 @@ async fn send_bridge_status_event(
         payload,
         Utc::now(),
     );
-    send_or_spool_event(
-        endpoint,
-        &args.bridge_token,
-        spool,
-        &event,
-        args.request_timeout_seconds,
-        spool_on_failure,
-    )
-    .await
+    send_or_spool_event(transport, spool, &event, spool_on_failure).await
 }
 
 async fn execute_turn_start_command(args: &Args, command: &BridgeCommand) -> Result<Value> {
@@ -891,6 +911,8 @@ mod tests {
     use chrono::TimeZone;
     use reqwest::StatusCode;
     use serde_json::json;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_async;
 
     use super::*;
 
@@ -924,6 +946,47 @@ mod tests {
             json!({ "source": "test" }),
             Utc.with_ymd_and_hms(2026, 6, 24, 12, 0, 0).unwrap(),
         )
+    }
+
+    fn unreachable_transport() -> BridgeTransport {
+        BridgeTransport::new(
+            "ws://not-used.example.test".to_string(),
+            "bridge-token".to_string(),
+            Duration::from_secs(1),
+        )
+    }
+
+    async fn accept_bridge_websocket(listener: &TcpListener) -> WebSocketStream<TcpStream> {
+        let (stream, _) = listener.accept().await.expect("accept bridge connection");
+        accept_async(stream).await.expect("accept bridge websocket")
+    }
+
+    async fn read_bridge_event(websocket: &mut WebSocketStream<TcpStream>) -> BridgeEventBody {
+        let message = tokio::time::timeout(Duration::from_secs(2), websocket.next())
+            .await
+            .expect("bridge event timed out")
+            .expect("bridge websocket closed")
+            .expect("read bridge event");
+        let WebSocketMessage::Text(text) = message else {
+            panic!("expected bridge event text frame, got {message:?}");
+        };
+        serde_json::from_str(&text).expect("decode bridge event")
+    }
+
+    async fn send_bridge_ack(websocket: &mut WebSocketStream<TcpStream>, sequence: i64) {
+        websocket
+            .send(WebSocketMessage::Text(
+                json!({
+                    "accepted": true,
+                    "duplicate": false,
+                    "acknowledgedSequence": sequence,
+                    "productEventId": sequence,
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send bridge ack");
     }
 
     #[test]
@@ -1034,14 +1097,13 @@ mod tests {
     async fn send_or_spool_queues_durable_event_behind_pending_spool() {
         let path = temp_spool_path("durable");
         let mut spool = EventSpool::load(path.clone(), 8).unwrap();
+        let mut transport = unreachable_transport();
         spool.append(test_event(1, "turn.completed")).unwrap();
 
         let result = send_or_spool_event(
-            "ws://not-used.example.test",
-            "bridge-token",
+            &mut transport,
             &mut spool,
             &test_event(2, "turn.failed"),
-            1,
             true,
         )
         .await;
@@ -1056,14 +1118,13 @@ mod tests {
     async fn send_or_spool_does_not_queue_pre_execution_command_ack() {
         let path = temp_spool_path("command-ack");
         let mut spool = EventSpool::load(path.clone(), 8).unwrap();
+        let mut transport = unreachable_transport();
         spool.append(test_event(1, "turn.completed")).unwrap();
 
         let result = send_or_spool_event(
-            "ws://not-used.example.test",
-            "bridge-token",
+            &mut transport,
             &mut spool,
             &test_event(2, "bridge.command_ack"),
-            1,
             false,
         )
         .await;
@@ -1072,5 +1133,80 @@ mod tests {
         assert_eq!(spool.events.len(), 1);
         assert_eq!(spool.events[0].event_type, "turn.completed");
         let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn bridge_transport_reuses_websocket_for_multiple_events() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind bridge test listener");
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut websocket = accept_bridge_websocket(&listener).await;
+            let mut sequences = Vec::new();
+            for _ in 0..2 {
+                let event = read_bridge_event(&mut websocket).await;
+                sequences.push(event.sequence);
+                send_bridge_ack(&mut websocket, event.sequence).await;
+            }
+            sequences
+        });
+        let mut transport =
+            BridgeTransport::new(endpoint, "bridge-token".to_string(), Duration::from_secs(2));
+
+        let first = transport
+            .send_event(&test_event(1, "heartbeat"))
+            .await
+            .unwrap();
+        let second = transport
+            .send_event(&test_event(2, "turn.completed"))
+            .await
+            .unwrap();
+
+        assert_eq!(first.transport, "websocket:persistent");
+        assert_eq!(second.transport, "websocket:persistent");
+        assert_eq!(first.ack.acknowledged_sequence, 1);
+        assert_eq!(second.ack.acknowledged_sequence, 2);
+        assert_eq!(server.await.unwrap(), vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn bridge_transport_reconnects_and_resends_after_dropped_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind bridge test listener");
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut sequences = Vec::new();
+            let mut first_connection = accept_bridge_websocket(&listener).await;
+            sequences.push(read_bridge_event(&mut first_connection).await.sequence);
+            first_connection
+                .close(None)
+                .await
+                .expect("close first socket");
+
+            let mut second_connection = accept_bridge_websocket(&listener).await;
+            for _ in 0..2 {
+                let event = read_bridge_event(&mut second_connection).await;
+                sequences.push(event.sequence);
+                send_bridge_ack(&mut second_connection, event.sequence).await;
+            }
+            sequences
+        });
+        let mut transport =
+            BridgeTransport::new(endpoint, "bridge-token".to_string(), Duration::from_secs(2));
+
+        let first = transport
+            .send_event(&test_event(1, "heartbeat"))
+            .await
+            .unwrap();
+        let second = transport
+            .send_event(&test_event(2, "turn.completed"))
+            .await
+            .unwrap();
+
+        assert_eq!(first.ack.acknowledged_sequence, 1);
+        assert_eq!(second.ack.acknowledged_sequence, 2);
+        assert_eq!(server.await.unwrap(), vec![1, 1, 2]);
     }
 }
