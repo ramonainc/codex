@@ -2,7 +2,6 @@ use std::env;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -14,6 +13,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
+use tokio::process::Command;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::connect_async;
@@ -30,6 +30,7 @@ const DEFAULT_TURN_TIMEOUT_SECONDS: u64 = 1200;
 const DEFAULT_CODEX_APP_SERVER_WS: &str = "ws://127.0.0.1:43113";
 const DEFAULT_MODEL: &str = "gpt-5-codex";
 const TURN_RESULT_MARKER: &str = "SEMAPHORE_CODEX_APP_SERVER_TURN_RESULT_V1";
+const CONTROL_RESULT_MARKER: &str = "SEMAPHORE_CODEX_APP_SERVER_CONTROL_RESULT_V1";
 const DEFAULT_SPOOL_MAX_EVENTS: usize = 256;
 
 #[derive(Debug, Parser)]
@@ -744,20 +745,37 @@ async fn handle_bridge_command(
     .await?;
 
     match command.command_type.as_str() {
-        "turn.start" => match execute_turn_start_command(args, &command).await {
+        "turn.start" => match execute_turn_start_command(
+            args,
+            transport,
+            spool,
+            bridge_epoch,
+            sequence,
+            &command,
+        )
+        .await
+        {
             Ok(result) => {
                 let product_turn_id = command_payload_string(&command, "productTurnId")
                     .context("turn.start command is missing productTurnId")?;
+                let interrupted = result
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(|status| status == "interrupted");
                 send_bridge_status_event(
                     args,
                     transport,
                     spool,
                     bridge_epoch,
                     sequence,
-                    "turn.completed",
+                    if interrupted {
+                        "turn.interrupted"
+                    } else {
+                        "turn.completed"
+                    },
                     json!({
                         "source": "semaphore-sandbox-bridge",
-                        "message": "Codex turn completed",
+                        "message": if interrupted { "Codex turn interrupted" } else { "Codex turn completed" },
                         "bridgeCommandId": command.id,
                         "productTurnId": product_turn_id,
                         "response": result.get("response").cloned().unwrap_or(Value::Null),
@@ -786,6 +804,51 @@ async fn handle_bridge_command(
                         "message": "Codex turn failed",
                         "bridgeCommandId": command.id,
                         "productTurnId": product_turn_id,
+                        "error": error.to_string(),
+                    }),
+                    true,
+                )
+                .await?;
+                Err(error)
+            }
+        },
+        "turn.steer" | "turn.interrupt" => match execute_turn_control_command(&command).await {
+            Ok(result) => {
+                let product_turn_id = command_payload_string(&command, "productTurnId");
+                send_bridge_status_event(
+                    args,
+                    transport,
+                    spool,
+                    bridge_epoch,
+                    sequence,
+                    "bridge.command_succeeded",
+                    json!({
+                        "source": "semaphore-sandbox-bridge",
+                        "message": format!("Bridge command completed: {}", command.command_type),
+                        "bridgeCommandId": command.id,
+                        "commandType": command.command_type,
+                        "productTurnId": product_turn_id,
+                        "result": result,
+                    }),
+                    true,
+                )
+                .await
+                .map(|_| ())
+            }
+            Err(error) => {
+                send_bridge_status_event(
+                    args,
+                    transport,
+                    spool,
+                    bridge_epoch,
+                    sequence,
+                    "bridge.command_failed",
+                    json!({
+                        "source": "semaphore-sandbox-bridge",
+                        "message": format!("Bridge command failed: {}", command.command_type),
+                        "bridgeCommandId": command.id,
+                        "commandType": command.command_type,
+                        "productTurnId": command_payload_string(&command, "productTurnId"),
                         "error": error.to_string(),
                     }),
                     true,
@@ -840,7 +903,14 @@ async fn send_bridge_status_event(
     send_or_spool_event(transport, spool, &event, spool_on_failure).await
 }
 
-async fn execute_turn_start_command(args: &Args, command: &BridgeCommand) -> Result<Value> {
+async fn execute_turn_start_command(
+    args: &Args,
+    transport: &mut BridgeTransport,
+    spool: &mut EventSpool,
+    bridge_epoch: &str,
+    sequence: &mut i64,
+    command: &BridgeCommand,
+) -> Result<Value> {
     let runner = semaphore_codex_runner_bin().context("semaphore-codex-runner is not installed")?;
     let message = command_payload_string(command, "message")
         .context("turn.start command is missing message")?;
@@ -866,42 +936,43 @@ async fn execute_turn_start_command(args: &Args, command: &BridgeCommand) -> Res
     let bridge_token = args.bridge_token.clone();
     let rust_log = env::var("RUST_LOG").unwrap_or_else(|_| "warn".to_string());
 
-    let output = tokio::time::timeout(
-        Duration::from_secs(timeout_seconds),
-        tokio::task::spawn_blocking(move || {
-            let mut process = Command::new(runner);
-            process
-                .arg("turn")
-                .arg("--websocket-url")
-                .arg(websocket_url)
-                .arg("--model")
-                .arg(model)
-                .arg("--message")
-                .arg(message)
-                .env("SEMAPHORE_API_BASE_URL", api_base_url)
-                .env("SEMAPHORE_ORGANIZATION_ID", organization_id)
-                .env("SEMAPHORE_PRODUCT_SESSION_ID", session_id)
-                .env("SEMAPHORE_RUNTIME_ID", runtime_id)
-                .env("SEMAPHORE_PRODUCT_TURN_ID", product_turn_id)
-                .env("SEMAPHORE_SANDBOX_BRIDGE_TOKEN", bridge_token)
-                .env("NO_COLOR", "1")
-                .env("RUST_LOG", rust_log);
-            if let Some(cwd) = cwd {
-                process.arg("--cwd").arg(cwd);
-            }
-            if let Some(client_message_id) = client_message_id {
-                process.arg("--client-message-id").arg(client_message_id);
-            }
-            if let Some(codex_home) = codex_home {
-                process.env("CODEX_HOME", codex_home);
-            }
-            process.output()
-        }),
+    let mut process = Command::new(runner);
+    process
+        .arg("turn")
+        .arg("--websocket-url")
+        .arg(websocket_url)
+        .arg("--model")
+        .arg(model)
+        .arg("--message")
+        .arg(message)
+        .env("SEMAPHORE_API_BASE_URL", api_base_url)
+        .env("SEMAPHORE_ORGANIZATION_ID", organization_id)
+        .env("SEMAPHORE_PRODUCT_SESSION_ID", session_id)
+        .env("SEMAPHORE_RUNTIME_ID", runtime_id)
+        .env("SEMAPHORE_PRODUCT_TURN_ID", product_turn_id)
+        .env("SEMAPHORE_SANDBOX_BRIDGE_TOKEN", bridge_token)
+        .env("NO_COLOR", "1")
+        .env("RUST_LOG", rust_log);
+    if let Some(cwd) = cwd {
+        process.arg("--cwd").arg(cwd);
+    }
+    if let Some(client_message_id) = client_message_id {
+        process.arg("--client-message-id").arg(client_message_id);
+    }
+    if let Some(codex_home) = codex_home {
+        process.env("CODEX_HOME", codex_home);
+    }
+    let output = wait_for_turn_runner_with_control(
+        args,
+        transport,
+        spool,
+        bridge_epoch,
+        sequence,
+        command,
+        process,
+        timeout_seconds,
     )
-    .await
-    .context("timed out waiting for semaphore-codex-runner")?
-    .context("failed to join semaphore-codex-runner task")?
-    .context("failed to execute semaphore-codex-runner")?;
+    .await?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -917,6 +988,255 @@ async fn execute_turn_start_command(args: &Args, command: &BridgeCommand) -> Res
         );
     }
     parse_turn_result(&stdout)
+}
+
+async fn wait_for_turn_runner_with_control(
+    args: &Args,
+    transport: &mut BridgeTransport,
+    spool: &mut EventSpool,
+    bridge_epoch: &str,
+    sequence: &mut i64,
+    active_turn_command: &BridgeCommand,
+    mut process: Command,
+    timeout_seconds: u64,
+) -> Result<std::process::Output> {
+    let output = tokio::time::timeout(Duration::from_secs(timeout_seconds), process.output());
+    tokio::pin!(output);
+    loop {
+        tokio::select! {
+            result = &mut output => {
+                return result
+                    .context("timed out waiting for semaphore-codex-runner")?
+                    .context("failed to execute semaphore-codex-runner");
+            }
+            commands = transport.read_pushed_commands(), if args.drain_commands => {
+                match commands {
+                    Ok(commands) => {
+                        handle_active_turn_control_commands(
+                            args,
+                            transport,
+                            spool,
+                            bridge_epoch,
+                            sequence,
+                            active_turn_command,
+                            commands,
+                        )
+                        .await;
+                    }
+                    Err(error) => eprintln!("Sandbox bridge control command read failed: {error:#}"),
+                }
+            }
+        }
+    }
+}
+
+async fn handle_active_turn_control_commands(
+    args: &Args,
+    transport: &mut BridgeTransport,
+    spool: &mut EventSpool,
+    bridge_epoch: &str,
+    sequence: &mut i64,
+    active_turn_command: &BridgeCommand,
+    commands: Vec<BridgeCommand>,
+) {
+    for command in commands {
+        if let Err(error) = handle_active_turn_control_command(
+            args,
+            transport,
+            spool,
+            bridge_epoch,
+            sequence,
+            active_turn_command,
+            command,
+        )
+        .await
+        {
+            eprintln!("Sandbox bridge control command failed: {error:#}");
+        }
+    }
+}
+
+async fn handle_active_turn_control_command(
+    args: &Args,
+    transport: &mut BridgeTransport,
+    spool: &mut EventSpool,
+    bridge_epoch: &str,
+    sequence: &mut i64,
+    active_turn_command: &BridgeCommand,
+    command: BridgeCommand,
+) -> Result<()> {
+    send_bridge_status_event(
+        args,
+        transport,
+        spool,
+        bridge_epoch,
+        sequence,
+        "bridge.command_ack",
+        json!({
+            "source": "semaphore-sandbox-bridge",
+            "message": format!("Bridge command accepted: {}", command.command_type),
+            "bridgeCommandId": command.id,
+            "commandType": command.command_type,
+            "accepted": true,
+        }),
+        false,
+    )
+    .await?;
+    if !matches!(
+        command.command_type.as_str(),
+        "turn.steer" | "turn.interrupt"
+    ) {
+        send_bridge_status_event(
+            args,
+            transport,
+            spool,
+            bridge_epoch,
+            sequence,
+            "bridge.command_failed",
+            json!({
+                "source": "semaphore-sandbox-bridge",
+                "message": format!("Unsupported active-turn bridge command: {}", command.command_type),
+                "bridgeCommandId": command.id,
+                "commandType": command.command_type,
+            }),
+            true,
+        )
+        .await?;
+        return Err(anyhow!(
+            "unsupported active-turn bridge command `{}`",
+            command.command_type
+        ));
+    }
+    let active_product_turn_id = command_payload_string(active_turn_command, "productTurnId")
+        .context("active turn command is missing productTurnId")?;
+    let product_turn_id = command_payload_string(&command, "productTurnId")
+        .context("control command is missing productTurnId")?;
+    if product_turn_id != active_product_turn_id {
+        send_bridge_status_event(
+            args,
+            transport,
+            spool,
+            bridge_epoch,
+            sequence,
+            "bridge.command_failed",
+            json!({
+                "source": "semaphore-sandbox-bridge",
+                "message": "Control command did not match active turn",
+                "bridgeCommandId": command.id,
+                "commandType": command.command_type,
+                "productTurnId": product_turn_id,
+                "activeProductTurnId": active_product_turn_id,
+            }),
+            true,
+        )
+        .await?;
+        return Err(anyhow!("control command did not match active turn"));
+    }
+    match execute_turn_control_command(&command).await {
+        Ok(result) => {
+            send_bridge_status_event(
+                args,
+                transport,
+                spool,
+                bridge_epoch,
+                sequence,
+                "bridge.command_succeeded",
+                json!({
+                    "source": "semaphore-sandbox-bridge",
+                    "message": format!("Bridge command completed: {}", command.command_type),
+                    "bridgeCommandId": command.id,
+                    "commandType": command.command_type,
+                    "productTurnId": product_turn_id,
+                    "result": result,
+                }),
+                true,
+            )
+            .await?;
+            Ok(())
+        }
+        Err(error) => {
+            send_bridge_status_event(
+                args,
+                transport,
+                spool,
+                bridge_epoch,
+                sequence,
+                "bridge.command_failed",
+                json!({
+                    "source": "semaphore-sandbox-bridge",
+                    "message": format!("Bridge command failed: {}", command.command_type),
+                    "bridgeCommandId": command.id,
+                    "commandType": command.command_type,
+                    "productTurnId": product_turn_id,
+                    "error": error.to_string(),
+                }),
+                true,
+            )
+            .await?;
+            Err(error)
+        }
+    }
+}
+
+async fn execute_turn_control_command(command: &BridgeCommand) -> Result<Value> {
+    let runner = semaphore_codex_runner_bin().context("semaphore-codex-runner is not installed")?;
+    let product_turn_id = command_payload_string(command, "productTurnId")
+        .context("control command is missing productTurnId")?;
+    let thread_id = command_payload_string(command, "threadId")
+        .context("control command is missing threadId")?;
+    let codex_turn_id = command_payload_string(command, "codexTurnId")
+        .context("control command is missing codexTurnId")?;
+    let websocket_url = command_payload_string(command, "appServerWs")
+        .unwrap_or_else(|| DEFAULT_CODEX_APP_SERVER_WS.to_string());
+    let codex_home = command_payload_string(command, "codexHome");
+    let client_message_id = command_payload_string(command, "clientMessageId");
+    let rust_log = env::var("RUST_LOG").unwrap_or_else(|_| "warn".to_string());
+    let mut process = Command::new(runner);
+    match command.command_type.as_str() {
+        "turn.steer" => {
+            let message = command_payload_string(command, "message")
+                .context("turn.steer command is missing message")?;
+            process.arg("steer").arg("--message").arg(message);
+        }
+        "turn.interrupt" => {
+            process.arg("interrupt");
+        }
+        other => return Err(anyhow!("unsupported control command `{other}`")),
+    }
+    process
+        .arg("--websocket-url")
+        .arg(websocket_url)
+        .arg("--thread-id")
+        .arg(thread_id)
+        .arg("--turn-id")
+        .arg(codex_turn_id)
+        .env("SEMAPHORE_PRODUCT_TURN_ID", product_turn_id)
+        .env("NO_COLOR", "1")
+        .env("RUST_LOG", rust_log);
+    if let Some(client_message_id) = client_message_id {
+        process.arg("--client-message-id").arg(client_message_id);
+    }
+    if let Some(codex_home) = codex_home {
+        process.env("CODEX_HOME", codex_home);
+    }
+    let output = tokio::time::timeout(Duration::from_secs(30), process.output())
+        .await
+        .context("timed out waiting for semaphore-codex-runner control command")?
+        .context("failed to execute semaphore-codex-runner control command")?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if !output.status.success() {
+        bail!(
+            "semaphore-codex-runner control exited with {}: {}",
+            output
+                .status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".to_string()),
+            command_output_summary(&stdout, &stderr)
+        );
+    }
+    parse_control_result(&stdout)
 }
 
 fn semaphore_codex_runner_bin() -> Option<PathBuf> {
@@ -945,16 +1265,25 @@ fn semaphore_codex_runner_bin() -> Option<PathBuf> {
 }
 
 fn parse_turn_result(stdout: &str) -> Result<Value> {
+    parse_marked_json(stdout, TURN_RESULT_MARKER, "turn result")
+}
+
+fn parse_control_result(stdout: &str) -> Result<Value> {
+    parse_marked_json(stdout, CONTROL_RESULT_MARKER, "control result")
+}
+
+fn parse_marked_json(stdout: &str, marker: &str, label: &str) -> Result<Value> {
     let mut lines = stdout.lines();
     while let Some(line) = lines.next() {
-        if line.trim() == TURN_RESULT_MARKER {
+        if line.trim() == marker {
             let payload = lines
                 .next()
-                .ok_or_else(|| anyhow!("turn result marker was not followed by JSON"))?;
-            return serde_json::from_str(payload).context("turn result JSON was invalid");
+                .ok_or_else(|| anyhow!("{label} marker was not followed by JSON"))?;
+            return serde_json::from_str(payload)
+                .with_context(|| format!("{label} JSON was invalid"));
         }
     }
-    Err(anyhow!("turn result marker was not found"))
+    Err(anyhow!("{label} marker was not found"))
 }
 
 fn command_payload_string(command: &BridgeCommand, key: &str) -> Option<String> {
@@ -1198,6 +1527,17 @@ mod tests {
 
         assert_eq!(result["response"], "done");
         assert_eq!(result["threadId"], "thread-1");
+    }
+
+    #[test]
+    fn control_result_parser_reads_runner_marker_json() {
+        let result = parse_control_result(
+            "log\nSEMAPHORE_CODEX_APP_SERVER_CONTROL_RESULT_V1\n{\"command\":\"turn.interrupt\",\"accepted\":true}\n",
+        )
+        .unwrap();
+
+        assert_eq!(result["command"], "turn.interrupt");
+        assert_eq!(result["accepted"], true);
     }
 
     #[test]

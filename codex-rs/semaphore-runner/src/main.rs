@@ -15,13 +15,15 @@ use codex_app_server_protocol::{
     JSONRPCErrorError, McpServerElicitationAction, McpServerElicitationRequestResponse,
     PermissionGrantScope, PermissionsRequestApprovalResponse, RequestId, SandboxMode,
     SandboxPolicy, ServerNotification, ServerRequest, ThreadItem, ThreadSource, ThreadStartParams,
-    ThreadStartResponse, TurnStartParams, TurnStartResponse, TurnStatus, UserInput,
+    ThreadStartResponse, TurnInterruptParams, TurnInterruptResponse, TurnStartParams,
+    TurnStartResponse, TurnStatus, TurnSteerParams, TurnSteerResponse, UserInput,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::time::timeout;
 
 const RESULT_MARKER: &str = "SEMAPHORE_CODEX_APP_SERVER_TURN_RESULT_V1";
+const CONTROL_RESULT_MARKER: &str = "SEMAPHORE_CODEX_APP_SERVER_CONTROL_RESULT_V1";
 const DEFAULT_WEBSOCKET_URL: &str = "ws://127.0.0.1:43113";
 const DEFAULT_MODEL: &str = "gpt-5-codex";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 1200;
@@ -38,6 +40,8 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Turn(TurnCommand),
+    Steer(TurnSteerCommand),
+    Interrupt(TurnInterruptCommand),
 }
 
 #[derive(Debug, Parser)]
@@ -60,11 +64,42 @@ struct TurnCommand {
     timeout_seconds: u64,
 }
 
+#[derive(Debug, Parser)]
+struct TurnSteerCommand {
+    #[arg(long, env = "SEMAPHORE_CODEX_APP_SERVER_WS", default_value = DEFAULT_WEBSOCKET_URL)]
+    websocket_url: String,
+    #[arg(long)]
+    thread_id: String,
+    #[arg(long)]
+    turn_id: String,
+    #[arg(long, env = "SEMAPHORE_CODEX_STEER_MESSAGE")]
+    message: Option<String>,
+    #[arg(long)]
+    message_file: Option<PathBuf>,
+    #[arg(long, env = "SEMAPHORE_CODEX_CLIENT_MESSAGE_ID")]
+    client_message_id: Option<String>,
+    #[arg(long, env = "SEMAPHORE_PRODUCT_TURN_ID")]
+    product_turn_id: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+struct TurnInterruptCommand {
+    #[arg(long, env = "SEMAPHORE_CODEX_APP_SERVER_WS", default_value = DEFAULT_WEBSOCKET_URL)]
+    websocket_url: String,
+    #[arg(long)]
+    thread_id: String,
+    #[arg(long)]
+    turn_id: String,
+    #[arg(long, env = "SEMAPHORE_PRODUCT_TURN_ID")]
+    product_turn_id: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TurnResult {
     schema_version: u8,
     source: &'static str,
+    status: &'static str,
     response: String,
     thread_id: String,
     codex_session_id: String,
@@ -81,6 +116,18 @@ struct TurnResult {
     timeout_seconds: u64,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ControlResult {
+    schema_version: u8,
+    source: &'static str,
+    command: &'static str,
+    thread_id: String,
+    turn_id: String,
+    product_turn_id: Option<String>,
+    accepted: bool,
+}
+
 #[derive(Debug, Default)]
 struct TurnAccumulator {
     response_delta: String,
@@ -90,6 +137,7 @@ struct TurnAccumulator {
     item_completed_count: u64,
     server_request_count: u64,
     auto_approved_request_count: u64,
+    interrupted: bool,
 }
 
 struct RequestIds {
@@ -119,6 +167,8 @@ async fn main() -> Result<()> {
 
     match Cli::parse().command {
         Command::Turn(command) => run_turn(command).await,
+        Command::Steer(command) => run_steer(command).await,
+        Command::Interrupt(command) => run_interrupt(command).await,
     }
 }
 
@@ -130,25 +180,7 @@ async fn run_turn(command: TurnCommand) -> Result<()> {
         .as_ref()
         .map(|path| path.to_string_lossy().to_string());
 
-    let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-        endpoint: RemoteAppServerEndpoint::WebSocket {
-            websocket_url: command.websocket_url.clone(),
-            auth_token: None,
-        },
-        client_name: "semaphore-codex-runner".to_string(),
-        client_version: env!("CARGO_PKG_VERSION").to_string(),
-        experimental_api: true,
-        mcp_server_openai_form_elicitation: true,
-        opt_out_notification_methods: Vec::new(),
-        channel_capacity: 512,
-    })
-    .await
-    .with_context(|| {
-        format!(
-            "failed to connect to Codex app-server at `{}`",
-            command.websocket_url
-        )
-    })?;
+    let mut client = connect_app_server(&command.websocket_url).await?;
 
     let server_version = client.server_version().map(ToOwned::to_owned);
     let codex_home = client.codex_home().map(ToOwned::to_owned);
@@ -247,17 +279,24 @@ async fn run_turn(command: TurnCommand) -> Result<()> {
         .await
         .context("failed to shutdown Codex app-server client")?;
 
-    let response = accumulator
-        .completed_agent_message
-        .or_else(|| {
-            let response = accumulator.response_delta.trim().to_string();
-            (!response.is_empty()).then_some(response)
-        })
-        .ok_or_else(|| anyhow!("Codex turn completed without an assistant response"))?;
+    let response = accumulator.completed_agent_message.or_else(|| {
+        let response = accumulator.response_delta.trim().to_string();
+        (!response.is_empty()).then_some(response)
+    });
+    let response = if accumulator.interrupted {
+        response.unwrap_or_default()
+    } else {
+        response.ok_or_else(|| anyhow!("Codex turn completed without an assistant response"))?
+    };
 
     let result = TurnResult {
         schema_version: 1,
         source: "codex_app_server_remote_client",
+        status: if accumulator.interrupted {
+            "interrupted"
+        } else {
+            "completed"
+        },
         response,
         thread_id: thread.thread.id.clone(),
         codex_session_id: thread.thread.session_id.clone(),
@@ -279,6 +318,93 @@ async fn run_turn(command: TurnCommand) -> Result<()> {
     Ok(())
 }
 
+async fn run_steer(command: TurnSteerCommand) -> Result<()> {
+    let message = read_steer_message(&command)?;
+    let client = connect_app_server(&command.websocket_url).await?;
+    let mut request_ids = RequestIds::new();
+    let _: TurnSteerResponse = client
+        .request_typed(ClientRequest::TurnSteer {
+            request_id: request_ids.next(),
+            params: TurnSteerParams {
+                thread_id: command.thread_id.clone(),
+                client_user_message_id: command.client_message_id.clone(),
+                input: vec![UserInput::Text {
+                    text: message,
+                    text_elements: Vec::new(),
+                }],
+                responsesapi_client_metadata: None,
+                additional_context: None,
+                expected_turn_id: command.turn_id.clone(),
+            },
+        })
+        .await
+        .context("turn/steer failed")?;
+    client
+        .shutdown()
+        .await
+        .context("failed to shutdown Codex app-server client")?;
+    print_control_result(ControlResult {
+        schema_version: 1,
+        source: "codex_app_server_remote_client",
+        command: "turn.steer",
+        thread_id: command.thread_id,
+        turn_id: command.turn_id,
+        product_turn_id: command.product_turn_id,
+        accepted: true,
+    })
+}
+
+async fn run_interrupt(command: TurnInterruptCommand) -> Result<()> {
+    let client = connect_app_server(&command.websocket_url).await?;
+    let mut request_ids = RequestIds::new();
+    let _: TurnInterruptResponse = client
+        .request_typed(ClientRequest::TurnInterrupt {
+            request_id: request_ids.next(),
+            params: TurnInterruptParams {
+                thread_id: command.thread_id.clone(),
+                turn_id: command.turn_id.clone(),
+            },
+        })
+        .await
+        .context("turn/interrupt failed")?;
+    client
+        .shutdown()
+        .await
+        .context("failed to shutdown Codex app-server client")?;
+    print_control_result(ControlResult {
+        schema_version: 1,
+        source: "codex_app_server_remote_client",
+        command: "turn.interrupt",
+        thread_id: command.thread_id,
+        turn_id: command.turn_id,
+        product_turn_id: command.product_turn_id,
+        accepted: true,
+    })
+}
+
+async fn connect_app_server(websocket_url: &str) -> Result<RemoteAppServerClient> {
+    RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+        endpoint: RemoteAppServerEndpoint::WebSocket {
+            websocket_url: websocket_url.to_string(),
+            auth_token: None,
+        },
+        client_name: "semaphore-codex-runner".to_string(),
+        client_version: env!("CARGO_PKG_VERSION").to_string(),
+        experimental_api: true,
+        mcp_server_openai_form_elicitation: true,
+        opt_out_notification_methods: Vec::new(),
+        channel_capacity: 512,
+    })
+    .await
+    .with_context(|| format!("failed to connect to Codex app-server at `{websocket_url}`"))
+}
+
+fn print_control_result(result: ControlResult) -> Result<()> {
+    println!("{CONTROL_RESULT_MARKER}");
+    println!("{}", serde_json::to_string(&result)?);
+    Ok(())
+}
+
 fn read_message(command: &TurnCommand) -> Result<String> {
     if command.message.is_some() && command.message_file.is_some() {
         bail!("provide either --message or --message-file, not both");
@@ -291,6 +417,20 @@ fn read_message(command: &TurnCommand) -> Result<String> {
             .with_context(|| format!("failed to read message file `{}`", path.display()));
     }
     bail!("missing turn message; set --message, --message-file, or SEMAPHORE_CODEX_PROMPT")
+}
+
+fn read_steer_message(command: &TurnSteerCommand) -> Result<String> {
+    if command.message.is_some() && command.message_file.is_some() {
+        bail!("provide either --message or --message-file, not both");
+    }
+    if let Some(message) = command.message.as_ref() {
+        return Ok(message.clone());
+    }
+    if let Some(path) = command.message_file.as_ref() {
+        return std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read message file `{}`", path.display()));
+    }
+    bail!("missing steer message; set --message, --message-file, or SEMAPHORE_CODEX_STEER_MESSAGE")
 }
 
 async fn handle_event(
@@ -663,7 +803,10 @@ fn handle_notification(
                         .unwrap_or_else(|| "Codex turn failed".to_string());
                     bail!("{message}");
                 }
-                TurnStatus::Interrupted => bail!("Codex turn was interrupted"),
+                TurnStatus::Interrupted => {
+                    accumulator.interrupted = true;
+                    return Ok(true);
+                }
                 TurnStatus::InProgress => {}
             }
         }
