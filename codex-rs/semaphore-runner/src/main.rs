@@ -879,6 +879,24 @@ fn notification_payload_summary(value: &Value) -> Value {
         "item/reasoning/summaryPartAdded" => {
             insert_i64_field(&mut summary, params, "summaryIndex", "summaryIndex");
         }
+        "thread/status/changed" => {
+            insert_thread_status_summary(&mut summary, params.get("status"));
+        }
+        "thread/name/updated" => {
+            copy_string_field(&mut summary, params, "threadName", "threadName", 160);
+        }
+        "thread/goal/updated" => {
+            insert_thread_goal_summary(&mut summary, params.get("goal"));
+        }
+        "thread/goal/cleared" => {
+            summary.insert("goalCleared".to_string(), json!(true));
+        }
+        "item/autoApprovalReview/started" => {
+            insert_auto_review_summary(&mut summary, params, false);
+        }
+        "item/autoApprovalReview/completed" => {
+            insert_auto_review_summary(&mut summary, params, true);
+        }
         "item/commandExecution/outputDelta" => {
             insert_bounded_text_summary(
                 &mut summary,
@@ -886,6 +904,23 @@ fn notification_payload_summary(value: &Value) -> Value {
                 "delta",
                 "commandOutputDelta",
                 "commandOutputDeltaTruncated",
+                4_096,
+            );
+        }
+        "item/commandExecution/terminalInteraction" => {
+            copy_string_field(&mut summary, params, "processId", "processId", 160);
+            if let Some(stdin) = params.get("stdin").and_then(Value::as_str) {
+                summary.insert("stdinByteCount".to_string(), json!(stdin.len()));
+                summary.insert("stdinLineCount".to_string(), json!(stdin.lines().count()));
+            }
+        }
+        "item/fileChange/outputDelta" => {
+            insert_bounded_text_summary(
+                &mut summary,
+                params,
+                "delta",
+                "fileChangeOutputDelta",
+                "fileChangeOutputDeltaTruncated",
                 4_096,
             );
         }
@@ -898,6 +933,90 @@ fn notification_payload_summary(value: &Value) -> Value {
                 "progressMessageTruncated",
                 1_024,
             );
+        }
+        "mcpServer/startupStatus/updated" => {
+            copy_string_field(&mut summary, params, "name", "serverName", 160);
+            copy_string_field(&mut summary, params, "status", "serverStatus", 80);
+            insert_bounded_optional_string(
+                &mut summary,
+                params,
+                "error",
+                "errorPreview",
+                "errorPreviewTruncated",
+                1_024,
+            );
+        }
+        "fs/changed" => {
+            insert_changed_paths_summary(&mut summary, params);
+        }
+        "model/rerouted" => {
+            copy_string_field(&mut summary, params, "fromModel", "fromModel", 160);
+            copy_string_field(&mut summary, params, "toModel", "toModel", 160);
+            copy_string_field(&mut summary, params, "reason", "reason", 160);
+        }
+        "model/verification" => {
+            insert_string_array_summary(
+                &mut summary,
+                params,
+                "verifications",
+                "verifications",
+                "verificationCount",
+                20,
+                160,
+            );
+        }
+        "model/safetyBuffering/updated" => {
+            copy_string_field(&mut summary, params, "model", "model", 160);
+            insert_string_array_summary(
+                &mut summary,
+                params,
+                "useCases",
+                "useCases",
+                "useCaseCount",
+                20,
+                160,
+            );
+            insert_string_array_summary(
+                &mut summary,
+                params,
+                "reasons",
+                "reasons",
+                "reasonCount",
+                20,
+                240,
+            );
+        }
+        "warning" | "guardianWarning" => {
+            insert_bounded_text_summary(
+                &mut summary,
+                params,
+                "message",
+                "message",
+                "messageTruncated",
+                1_024,
+            );
+        }
+        "configWarning" => {
+            insert_bounded_text_summary(
+                &mut summary,
+                params,
+                "summary",
+                "summary",
+                "summaryTruncated",
+                1_024,
+            );
+            insert_bounded_optional_string(
+                &mut summary,
+                params,
+                "details",
+                "detailsPreview",
+                "detailsPreviewTruncated",
+                1_024,
+            );
+            copy_string_field(&mut summary, params, "path", "configPath", 512);
+        }
+        "error" => {
+            insert_error_summary(&mut summary, params);
         }
         "thread/tokenUsage/updated" => {
             insert_token_usage_summary(&mut summary, params);
@@ -998,6 +1117,215 @@ fn uppercase_first(value: &str) -> String {
     format!("{}{}", first.to_ascii_uppercase(), chars.as_str())
 }
 
+fn insert_thread_status_summary(
+    summary: &mut serde_json::Map<String, Value>,
+    status: Option<&Value>,
+) {
+    let Some(status) = status else {
+        return;
+    };
+    if let Some(status) = status.as_str() {
+        summary.insert("threadStatus".to_string(), json!(status));
+        return;
+    }
+    if let Some(status_type) = status.get("type").and_then(Value::as_str) {
+        summary.insert("threadStatus".to_string(), json!(status_type));
+    }
+    insert_string_array_summary(
+        summary,
+        status,
+        "activeFlags",
+        "activeFlags",
+        "activeFlagCount",
+        10,
+        80,
+    );
+}
+
+fn insert_thread_goal_summary(summary: &mut serde_json::Map<String, Value>, goal: Option<&Value>) {
+    let Some(goal) = goal else {
+        return;
+    };
+    copy_string_field(summary, goal, "status", "goalStatus", 80);
+    copy_string_field(summary, goal, "objective", "objective", 2_048);
+    insert_i64_field(summary, goal, "tokenBudget", "tokenBudget");
+    insert_i64_field(summary, goal, "tokensUsed", "tokensUsed");
+    insert_i64_field(summary, goal, "timeUsedSeconds", "timeUsedSeconds");
+}
+
+fn insert_auto_review_summary(
+    summary: &mut serde_json::Map<String, Value>,
+    params: &Value,
+    completed: bool,
+) {
+    copy_string_field(summary, params, "reviewId", "reviewId", 160);
+    copy_string_field(summary, params, "targetItemId", "targetItemId", 160);
+    if completed {
+        copy_string_field(summary, params, "decisionSource", "decisionSource", 80);
+    }
+    insert_i64_field(summary, params, "startedAtMs", "startedAtMs");
+    insert_i64_field(summary, params, "completedAtMs", "completedAtMs");
+    if let (Some(started), Some(completed_at)) = (
+        params.get("startedAtMs").and_then(Value::as_i64),
+        params.get("completedAtMs").and_then(Value::as_i64),
+    ) {
+        summary.insert(
+            "durationMs".to_string(),
+            json!(completed_at.saturating_sub(started)),
+        );
+    }
+    if let Some(review) = params.get("review") {
+        copy_string_field(summary, review, "status", "reviewStatus", 80);
+        copy_string_field(summary, review, "riskLevel", "riskLevel", 80);
+        copy_string_field(summary, review, "userAuthorization", "reviewUserLevel", 80);
+        insert_bounded_optional_string(
+            summary,
+            review,
+            "rationale",
+            "rationalePreview",
+            "rationalePreviewTruncated",
+            1_024,
+        );
+    }
+    if let Some(action) = params.get("action") {
+        insert_auto_review_action_summary(summary, action);
+    }
+}
+
+fn insert_auto_review_action_summary(summary: &mut serde_json::Map<String, Value>, action: &Value) {
+    copy_string_field(summary, action, "type", "actionType", 80);
+    copy_string_field(summary, action, "source", "actionSource", 80);
+    match action
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "command" => {
+            copy_string_field(summary, action, "command", "actionPreview", 512);
+            copy_string_field(summary, action, "cwd", "cwd", 512);
+        }
+        "execve" => {
+            copy_string_field(summary, action, "program", "actionPreview", 512);
+            copy_string_field(summary, action, "cwd", "cwd", 512);
+            if let Some(argv) = action.get("argv").and_then(Value::as_array) {
+                summary.insert("argvCount".to_string(), json!(argv.len()));
+            }
+        }
+        "applyPatch" => {
+            copy_string_field(summary, action, "cwd", "cwd", 512);
+            insert_string_array_summary(
+                summary,
+                action,
+                "files",
+                "filePaths",
+                "fileCount",
+                20,
+                512,
+            );
+        }
+        "networkAccess" => {
+            copy_string_field(summary, action, "host", "host", 255);
+            copy_string_field(summary, action, "protocol", "protocol", 40);
+            copy_string_field(summary, action, "target", "actionPreview", 512);
+            insert_i64_field(summary, action, "port", "port");
+        }
+        "mcpToolCall" => {
+            copy_string_field(summary, action, "server", "server", 160);
+            copy_string_field(summary, action, "toolName", "toolName", 160);
+            copy_string_field(summary, action, "toolTitle", "actionPreview", 240);
+            copy_string_field(summary, action, "connectorName", "connectorName", 160);
+        }
+        "requestPermissions" => {
+            summary.insert("permissionProfileRequested".to_string(), json!(true));
+            insert_bounded_optional_string(
+                summary,
+                action,
+                "reason",
+                "actionPreview",
+                "actionPreviewTruncated",
+                512,
+            );
+        }
+        _ => {}
+    }
+}
+
+fn insert_string_array_summary(
+    summary: &mut serde_json::Map<String, Value>,
+    value: &Value,
+    source_key: &str,
+    output_key: &str,
+    count_key: &str,
+    max_items: usize,
+    max_chars: usize,
+) {
+    let Some(items) = value.get(source_key).and_then(Value::as_array) else {
+        return;
+    };
+    summary.insert(count_key.to_string(), json!(items.len()));
+    let preview = items
+        .iter()
+        .filter_map(Value::as_str)
+        .take(max_items)
+        .map(|value| {
+            let (value, truncated) = bounded_text(value, max_chars);
+            json!({
+                "value": value,
+                "truncated": truncated,
+            })
+        })
+        .collect::<Vec<_>>();
+    summary.insert(output_key.to_string(), json!(preview));
+    summary.insert(
+        format!("{output_key}Truncated"),
+        json!(items.len() > max_items),
+    );
+}
+
+fn insert_changed_paths_summary(summary: &mut serde_json::Map<String, Value>, params: &Value) {
+    copy_string_field(summary, params, "watchId", "watchId", 160);
+    insert_string_array_summary(
+        summary,
+        params,
+        "changedPaths",
+        "changedPaths",
+        "changedPathCount",
+        20,
+        512,
+    );
+}
+
+fn insert_error_summary(summary: &mut serde_json::Map<String, Value>, params: &Value) {
+    if let Some(will_retry) = params.get("willRetry").and_then(Value::as_bool) {
+        summary.insert("willRetry".to_string(), json!(will_retry));
+    }
+    let Some(error) = params.get("error") else {
+        return;
+    };
+    if let Some(message) = error.as_str() {
+        let (message, truncated) = bounded_text(message, 1_024);
+        summary.insert("message".to_string(), json!(message));
+        summary.insert("messageTruncated".to_string(), json!(truncated));
+        return;
+    }
+    insert_bounded_optional_string(
+        summary,
+        error,
+        "message",
+        "message",
+        "messageTruncated",
+        1_024,
+    );
+    insert_bounded_optional_string(
+        summary,
+        error,
+        "additionalDetails",
+        "detailsPreview",
+        "detailsPreviewTruncated",
+        1_024,
+    );
+}
+
 fn insert_bounded_text_summary(
     summary: &mut serde_json::Map<String, Value>,
     params: &Value,
@@ -1012,6 +1340,27 @@ fn insert_bounded_text_summary(
     let (value, truncated) = bounded_text(value, max_chars);
     summary.insert(value_key.to_string(), json!(value));
     summary.insert(truncated_key.to_string(), json!(truncated));
+}
+
+fn insert_bounded_optional_string(
+    summary: &mut serde_json::Map<String, Value>,
+    params: &Value,
+    source_key: &str,
+    value_key: &str,
+    truncated_key: &str,
+    max_chars: usize,
+) {
+    if params.get(source_key).is_some_and(Value::is_null) {
+        return;
+    }
+    insert_bounded_text_summary(
+        summary,
+        params,
+        source_key,
+        value_key,
+        truncated_key,
+        max_chars,
+    );
 }
 
 fn insert_i64_field(
@@ -1648,6 +1997,113 @@ mod tests {
         assert_eq!(diff_summary["diffPreviewTruncated"], true);
         assert_eq!(diff_summary["diffLineCount"], 2);
         assert_eq!(diff_summary["diffByteCount"], 4209);
+    }
+
+    #[test]
+    fn compatibility_notification_summaries_are_bounded_and_redacted() {
+        let status_summary = notification_payload_summary(&json!({
+            "method": "thread/status/changed",
+            "params": {
+                "threadId": "thread-1",
+                "status": {
+                    "type": "active",
+                    "activeFlags": ["waitingOnApproval", "waitingOnUserInput"]
+                }
+            }
+        }));
+        assert_eq!(status_summary["threadStatus"], "active");
+        assert_eq!(status_summary["activeFlagCount"], 2);
+        assert_eq!(
+            status_summary["activeFlags"][0]["value"],
+            "waitingOnApproval"
+        );
+
+        let review_summary = notification_payload_summary(&json!({
+            "method": "item/autoApprovalReview/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "reviewId": "review-1",
+                "targetItemId": "item-1",
+                "startedAtMs": 10,
+                "completedAtMs": 30,
+                "decisionSource": "agent",
+                "review": {
+                    "status": "approved",
+                    "riskLevel": "medium",
+                    "userAuthorization": "high",
+                    "rationale": "safe enough"
+                },
+                "action": {
+                    "type": "requestPermissions",
+                    "reason": "Need broader access",
+                    "permissions": {
+                        "raw": "must not be copied"
+                    }
+                }
+            }
+        }));
+        assert_eq!(review_summary["reviewId"], "review-1");
+        assert_eq!(review_summary["reviewStatus"], "approved");
+        assert_eq!(review_summary["riskLevel"], "medium");
+        assert_eq!(review_summary["reviewUserLevel"], "high");
+        assert_eq!(review_summary["durationMs"], 20);
+        assert_eq!(review_summary["actionType"], "requestPermissions");
+        assert_eq!(review_summary["permissionProfileRequested"], true);
+        assert!(review_summary.get("permissions").is_none());
+
+        let terminal_summary = notification_payload_summary(&json!({
+            "method": "item/commandExecution/terminalInteraction",
+            "params": {
+                "processId": "process-1",
+                "stdin": "secret-looking input\n"
+            }
+        }));
+        assert_eq!(terminal_summary["processId"], "process-1");
+        assert_eq!(terminal_summary["stdinLineCount"], 1);
+        assert!(terminal_summary.get("stdin").is_none());
+
+        let fs_summary = notification_payload_summary(&json!({
+            "method": "fs/changed",
+            "params": {
+                "watchId": "watch-1",
+                "changedPaths": (0..25)
+                    .map(|index| format!("/workspace/file-{index}.rs"))
+                    .collect::<Vec<_>>()
+            }
+        }));
+        assert_eq!(fs_summary["changedPathCount"], 25);
+        assert_eq!(fs_summary["changedPaths"].as_array().unwrap().len(), 20);
+        assert_eq!(fs_summary["changedPathsTruncated"], true);
+
+        let error_summary = notification_payload_summary(&json!({
+            "method": "error",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "willRetry": true,
+                "error": {
+                    "message": "model auth expired",
+                    "additionalDetails": "refresh required"
+                }
+            }
+        }));
+        assert_eq!(error_summary["message"], "model auth expired");
+        assert_eq!(error_summary["willRetry"], true);
+
+        let model_summary = notification_payload_summary(&json!({
+            "method": "model/rerouted",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "fromModel": "gpt-5",
+                "toModel": "gpt-5-mini",
+                "reason": "highRiskCyberActivity"
+            }
+        }));
+        assert_eq!(model_summary["fromModel"], "gpt-5");
+        assert_eq!(model_summary["toModel"], "gpt-5-mini");
+        assert_eq!(model_summary["reason"], "highRiskCyberActivity");
     }
 
     #[test]
