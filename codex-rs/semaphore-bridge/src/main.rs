@@ -19,6 +19,8 @@ struct Args {
     api_base_url: String,
     #[arg(long, env = "SEMAPHORE_PRODUCT_SESSION_ID")]
     session_id: Uuid,
+    #[arg(long, env = "SEMAPHORE_ORGANIZATION_ID")]
+    organization_id: Uuid,
     #[arg(long, env = "SEMAPHORE_RUNTIME_ID")]
     runtime_id: Uuid,
     #[arg(long, env = "SEMAPHORE_SANDBOX_BRIDGE_TOKEN", hide_env_values = true)]
@@ -36,6 +38,7 @@ struct Args {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BridgeEventBody {
+    organization_id: Uuid,
     runtime_id: Uuid,
     schema_version: i32,
     bridge_epoch: String,
@@ -73,7 +76,13 @@ async fn main() -> Result<()> {
 
     let mut sequence = 1_i64;
     loop {
-        let event = heartbeat_event(args.runtime_id, &bridge_epoch, sequence, Utc::now());
+        let event = heartbeat_event(
+            args.organization_id,
+            args.runtime_id,
+            &bridge_epoch,
+            sequence,
+            Utc::now(),
+        );
         match post_bridge_event(&client, &endpoint, &args.bridge_token, &event).await {
             Ok(ack) => {
                 println!(
@@ -155,12 +164,14 @@ fn validate_bridge_epoch(value: &str) -> Result<()> {
 }
 
 fn heartbeat_event(
+    organization_id: Uuid,
     runtime_id: Uuid,
     bridge_epoch: &str,
     sequence: i64,
     occurred_at: DateTime<Utc>,
 ) -> BridgeEventBody {
     BridgeEventBody {
+        organization_id,
         runtime_id,
         schema_version: BRIDGE_SCHEMA_VERSION,
         bridge_epoch: bridge_epoch.to_string(),
@@ -221,6 +232,10 @@ mod tests {
         Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap()
     }
 
+    fn organization_id() -> Uuid {
+        Uuid::parse_str("99999999-9999-9999-9999-999999999999").unwrap()
+    }
+
     fn runtime_id() -> Uuid {
         Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap()
     }
@@ -236,11 +251,18 @@ mod tests {
     #[test]
     fn heartbeat_event_matches_product_bridge_envelope() {
         let occurred_at = Utc.with_ymd_and_hms(2026, 6, 24, 12, 0, 0).unwrap();
-        let body = heartbeat_event(runtime_id(), "runtime-epoch:pid-1:123", 4, occurred_at);
+        let body = heartbeat_event(
+            organization_id(),
+            runtime_id(),
+            "runtime-epoch:pid-1:123",
+            4,
+            occurred_at,
+        );
 
         assert_eq!(
             serde_json::to_value(body).unwrap(),
             json!({
+                "organizationId": "99999999-9999-9999-9999-999999999999",
                 "runtimeId": "22222222-2222-2222-2222-222222222222",
                 "schemaVersion": 1,
                 "bridgeEpoch": "runtime-epoch:pid-1:123",

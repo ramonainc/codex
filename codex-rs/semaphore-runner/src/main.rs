@@ -352,6 +352,7 @@ struct BridgeForwarder {
     client: reqwest::Client,
     endpoint: String,
     bridge_token: String,
+    organization_id: String,
     runtime_id: String,
     bridge_epoch: String,
     sequence: i64,
@@ -361,10 +362,12 @@ struct BridgeForwarder {
 impl BridgeForwarder {
     fn from_env(product_turn_id: Option<String>) -> Result<Option<Self>> {
         let api_base_url = optional_env("SEMAPHORE_API_BASE_URL");
+        let organization_id = optional_env("SEMAPHORE_ORGANIZATION_ID");
         let product_session_id = optional_env("SEMAPHORE_PRODUCT_SESSION_ID");
         let runtime_id = optional_env("SEMAPHORE_RUNTIME_ID");
         let bridge_token = optional_env("SEMAPHORE_SANDBOX_BRIDGE_TOKEN");
         if api_base_url.is_none()
+            && organization_id.is_none()
             && product_session_id.is_none()
             && runtime_id.is_none()
             && bridge_token.is_none()
@@ -373,6 +376,8 @@ impl BridgeForwarder {
         }
         let api_base_url =
             api_base_url.ok_or_else(|| anyhow!("SEMAPHORE_API_BASE_URL is required"))?;
+        let organization_id =
+            organization_id.ok_or_else(|| anyhow!("SEMAPHORE_ORGANIZATION_ID is required"))?;
         let product_session_id = product_session_id
             .ok_or_else(|| anyhow!("SEMAPHORE_PRODUCT_SESSION_ID is required"))?;
         let runtime_id = runtime_id.ok_or_else(|| anyhow!("SEMAPHORE_RUNTIME_ID is required"))?;
@@ -386,6 +391,7 @@ impl BridgeForwarder {
             client,
             endpoint: bridge_events_url(&api_base_url, &product_session_id),
             bridge_token,
+            organization_id,
             bridge_epoch: default_bridge_epoch(&runtime_id),
             runtime_id,
             sequence: 1,
@@ -433,6 +439,7 @@ impl BridgeForwarder {
         let sequence = self.sequence;
         self.sequence += 1;
         let body = bridge_event_body(
+            &self.organization_id,
             &self.runtime_id,
             &self.bridge_epoch,
             sequence,
@@ -484,6 +491,7 @@ fn default_bridge_epoch(runtime_id: &str) -> String {
 }
 
 fn bridge_event_body(
+    organization_id: &str,
     runtime_id: &str,
     bridge_epoch: &str,
     sequence: i64,
@@ -491,6 +499,7 @@ fn bridge_event_body(
     payload: Value,
 ) -> Value {
     json!({
+        "organizationId": organization_id,
         "runtimeId": runtime_id,
         "schemaVersion": BRIDGE_SCHEMA_VERSION,
         "bridgeEpoch": bridge_epoch,
@@ -796,6 +805,7 @@ mod tests {
     #[test]
     fn bridge_event_body_matches_product_ingress_envelope() {
         let body = bridge_event_body(
+            "99999999-9999-9999-9999-999999999999",
             "22222222-2222-2222-2222-222222222222",
             "runner-epoch:pid-1:123",
             3,
@@ -806,6 +816,7 @@ mod tests {
         assert_eq!(
             body,
             json!({
+                "organizationId": "99999999-9999-9999-9999-999999999999",
                 "runtimeId": "22222222-2222-2222-2222-222222222222",
                 "schemaVersion": 1,
                 "bridgeEpoch": "runner-epoch:pid-1:123",
