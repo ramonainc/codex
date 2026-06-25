@@ -1009,6 +1009,11 @@ fn notification_payload_summary(value: &Value) -> Value {
             summary.insert(key.to_string(), json!(value));
         }
     }
+    for key in ["capReached", "stdoutCapReached", "stderrCapReached"] {
+        if let Some(value) = params.get(key).and_then(Value::as_bool) {
+            summary.insert(key.to_string(), json!(value));
+        }
+    }
     match method {
         "item/agentMessage/delta" => {
             insert_bounded_text_summary(
@@ -1092,6 +1097,21 @@ fn notification_payload_summary(value: &Value) -> Value {
                     json!(delta.lines().count()),
                 );
             }
+        }
+        "command/exec/outputDelta" => {
+            copy_string_field(&mut summary, params, "processId", "processId", 160);
+            copy_string_field(&mut summary, params, "stream", "stream", 40);
+            insert_base64_delta_metadata(&mut summary, params, "deltaBase64");
+        }
+        "process/outputDelta" => {
+            copy_string_field(&mut summary, params, "processHandle", "processHandle", 160);
+            copy_string_field(&mut summary, params, "stream", "stream", 40);
+            insert_base64_delta_metadata(&mut summary, params, "deltaBase64");
+        }
+        "process/exited" => {
+            copy_string_field(&mut summary, params, "processHandle", "processHandle", 160);
+            insert_output_capture_metadata(&mut summary, params, "stdout", "stdout");
+            insert_output_capture_metadata(&mut summary, params, "stderr", "stderr");
         }
         "item/commandExecution/terminalInteraction" => {
             copy_string_field(&mut summary, params, "processId", "processId", 160);
@@ -1236,6 +1256,11 @@ fn notification_payload_summary(value: &Value) -> Value {
                 summary.insert("changeCount".to_string(), json!(changes.len()));
             }
         }
+        "hook/started" | "hook/completed" => {
+            if let Some(run) = params.get("run") {
+                insert_hook_run_summary(&mut summary, run);
+            }
+        }
         "turn/plan/updated" => {
             if let Some(explanation) = params.get("explanation").and_then(Value::as_str) {
                 let (value, truncated) = bounded_text(explanation, 2_048);
@@ -1261,9 +1286,50 @@ fn notification_payload_summary(value: &Value) -> Value {
                 summary.insert("item".to_string(), item_summary);
             }
         }
+        "rawResponseItem/completed" => {
+            if let Some(item) = params.get("item") {
+                let item_summary = summarize_thread_item(item);
+                if let Some(kind) = item_summary.get("kind").cloned() {
+                    summary.insert("itemKind".to_string(), kind);
+                }
+                summary.insert("item".to_string(), item_summary);
+            }
+        }
         _ => {}
     }
     Value::Object(summary)
+}
+
+fn insert_base64_delta_metadata(
+    summary: &mut serde_json::Map<String, Value>,
+    params: &Value,
+    source_key: &str,
+) {
+    let Some(value) = params.get(source_key).and_then(Value::as_str) else {
+        return;
+    };
+    summary.insert("encodedDeltaPresent".to_string(), json!(true));
+    summary.insert("encodedDeltaByteCount".to_string(), json!(value.len()));
+}
+
+fn insert_output_capture_metadata(
+    summary: &mut serde_json::Map<String, Value>,
+    params: &Value,
+    source_key: &str,
+    output_key_prefix: &str,
+) {
+    let Some(value) = params.get(source_key).and_then(Value::as_str) else {
+        return;
+    };
+    summary.insert(
+        format!("{output_key_prefix}Present"),
+        json!(!value.is_empty()),
+    );
+    summary.insert(format!("{output_key_prefix}ByteCount"), json!(value.len()));
+    summary.insert(
+        format!("{output_key_prefix}LineCount"),
+        json!(value.lines().count()),
+    );
 }
 
 fn insert_token_usage_summary(summary: &mut serde_json::Map<String, Value>, params: &Value) {
@@ -1520,6 +1586,44 @@ fn insert_error_summary(summary: &mut serde_json::Map<String, Value>, params: &V
         "detailsPreviewTruncated",
         1_024,
     );
+}
+
+fn insert_hook_run_summary(summary: &mut serde_json::Map<String, Value>, run: &Value) {
+    copy_string_field(summary, run, "id", "hookId", 160);
+    copy_string_field(summary, run, "eventName", "hookEventName", 120);
+    copy_string_field(summary, run, "handlerType", "hookHandlerType", 120);
+    copy_string_field(summary, run, "executionMode", "hookExecutionMode", 80);
+    copy_string_field(summary, run, "scope", "hookScope", 80);
+    copy_string_field(summary, run, "source", "hookSource", 120);
+    copy_string_field(summary, run, "status", "hookStatus", 80);
+    insert_bounded_optional_string(
+        summary,
+        run,
+        "statusMessage",
+        "hookStatusMessage",
+        "hookStatusMessageTruncated",
+        512,
+    );
+    insert_i64_field(summary, run, "durationMs", "hookDurationMs");
+    if let Some(entries) = run.get("entries").and_then(Value::as_array) {
+        summary.insert("hookEntryCount".to_string(), json!(entries.len()));
+        let mut kind_counts = serde_json::Map::new();
+        let mut output_bytes = 0usize;
+        for entry in entries {
+            if let Some(kind) = entry.get("kind").and_then(Value::as_str) {
+                let count = kind_counts.get(kind).and_then(Value::as_u64).unwrap_or(0) + 1;
+                kind_counts.insert(kind.to_string(), json!(count));
+            }
+            if let Some(text) = entry.get("text").and_then(Value::as_str) {
+                output_bytes = output_bytes.saturating_add(text.len());
+            }
+        }
+        summary.insert(
+            "hookEntryKindCounts".to_string(),
+            Value::Object(kind_counts),
+        );
+        summary.insert("hookOutputTextByteCount".to_string(), json!(output_bytes));
+    }
 }
 
 fn insert_bounded_text_summary(
@@ -2883,6 +2987,130 @@ mod tests {
         assert_eq!(model_summary["fromModel"], "gpt-5");
         assert_eq!(model_summary["toModel"], "gpt-5-mini");
         assert_eq!(model_summary["reason"], "highRiskCyberActivity");
+    }
+
+    #[test]
+    fn core_runtime_notification_summaries_keep_counts_without_raw_output() {
+        let command_summary = notification_payload_summary(&json!({
+            "method": "command/exec/outputDelta",
+            "params": {
+                "processId": "process-1",
+                "stream": "stdout",
+                "deltaBase64": "Zm9v",
+                "capReached": true
+            }
+        }));
+        assert_eq!(command_summary["processId"], "process-1");
+        assert_eq!(command_summary["stream"], "stdout");
+        assert_eq!(command_summary["encodedDeltaPresent"], true);
+        assert_eq!(command_summary["encodedDeltaByteCount"], 4);
+        assert_eq!(command_summary["capReached"], true);
+        assert!(command_summary.get("deltaBase64").is_none());
+        assert!(!command_summary.to_string().contains("Zm9v"));
+
+        let process_output_summary = notification_payload_summary(&json!({
+            "method": "process/outputDelta",
+            "params": {
+                "processHandle": "process-handle-1",
+                "stream": "stderr",
+                "deltaBase64": "YmFy"
+            }
+        }));
+        assert_eq!(process_output_summary["processHandle"], "process-handle-1");
+        assert_eq!(process_output_summary["stream"], "stderr");
+        assert_eq!(process_output_summary["encodedDeltaPresent"], true);
+        assert_eq!(process_output_summary["encodedDeltaByteCount"], 4);
+        assert!(process_output_summary.get("deltaBase64").is_none());
+        assert!(!process_output_summary.to_string().contains("YmFy"));
+
+        let process_exit_summary = notification_payload_summary(&json!({
+            "method": "process/exited",
+            "params": {
+                "processHandle": "process-handle-1",
+                "exitCode": 2,
+                "stdout": "SECRET_STDOUT\n",
+                "stdoutCapReached": false,
+                "stderr": "SECRET_STDERR",
+                "stderrCapReached": true
+            }
+        }));
+        assert_eq!(process_exit_summary["processHandle"], "process-handle-1");
+        assert_eq!(process_exit_summary["exitCode"], 2);
+        assert_eq!(process_exit_summary["stdoutPresent"], true);
+        assert_eq!(process_exit_summary["stdoutByteCount"], 14);
+        assert_eq!(process_exit_summary["stdoutLineCount"], 1);
+        assert_eq!(process_exit_summary["stderrPresent"], true);
+        assert_eq!(process_exit_summary["stderrByteCount"], 13);
+        assert_eq!(process_exit_summary["stderrLineCount"], 1);
+        assert_eq!(process_exit_summary["stdoutCapReached"], false);
+        assert_eq!(process_exit_summary["stderrCapReached"], true);
+        assert!(process_exit_summary.get("stdout").is_none());
+        assert!(process_exit_summary.get("stderr").is_none());
+        assert!(!process_exit_summary.to_string().contains("SECRET_STDOUT"));
+        assert!(!process_exit_summary.to_string().contains("SECRET_STDERR"));
+
+        let patch_summary = notification_payload_summary(&json!({
+            "method": "item/fileChange/patchUpdated",
+            "params": {
+                "changes": [
+                    {"path": "src/lib.rs", "status": "modified"},
+                    {"path": "src/main.rs", "status": "added"}
+                ]
+            }
+        }));
+        assert_eq!(patch_summary["changeCount"], 2);
+        assert!(patch_summary.get("changes").is_none());
+
+        let hook_summary = notification_payload_summary(&json!({
+            "method": "hook/completed",
+            "params": {
+                "run": {
+                    "id": "hook-1",
+                    "eventName": "PostToolUse",
+                    "handlerType": "command",
+                    "executionMode": "blocking",
+                    "scope": "session",
+                    "source": "project",
+                    "status": "completed",
+                    "statusMessage": "ok",
+                    "durationMs": 12,
+                    "entries": [
+                        {"kind": "warning", "text": "SECRET_HOOK"}
+                    ]
+                }
+            }
+        }));
+        assert_eq!(hook_summary["hookId"], "hook-1");
+        assert_eq!(hook_summary["hookEventName"], "PostToolUse");
+        assert_eq!(hook_summary["hookHandlerType"], "command");
+        assert_eq!(hook_summary["hookStatus"], "completed");
+        assert_eq!(hook_summary["hookDurationMs"], 12);
+        assert_eq!(hook_summary["hookEntryCount"], 1);
+        assert_eq!(hook_summary["hookOutputTextByteCount"], 11);
+        assert!(hook_summary.get("entries").is_none());
+        assert!(!hook_summary.to_string().contains("SECRET_HOOK"));
+
+        let raw_response_summary = notification_payload_summary(&json!({
+            "method": "rawResponseItem/completed",
+            "params": {
+                "item": {
+                    "type": "function_call_output",
+                    "call_id": "call-1",
+                    "output": {
+                        "type": "text",
+                        "text": "SECRET_RAW_OUTPUT"
+                    }
+                }
+            }
+        }));
+        assert_eq!(raw_response_summary["itemKind"], "function_call_output");
+        assert_eq!(raw_response_summary["item"]["kind"], "function_call_output");
+        assert!(raw_response_summary["item"].get("output").is_none());
+        assert!(
+            !raw_response_summary
+                .to_string()
+                .contains("SECRET_RAW_OUTPUT")
+        );
     }
 
     #[test]
