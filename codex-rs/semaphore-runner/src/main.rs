@@ -10,10 +10,12 @@ use codex_app_server_client::{
 };
 use codex_app_server_protocol::{
     AgentMessageDeltaNotification, ApprovalsReviewer, AskForApproval, ClientRequest,
-    CommandExecutionApprovalDecision, CommandExecutionRequestApprovalResponse,
-    FileChangeApprovalDecision, FileChangeRequestApprovalResponse, GrantedPermissionProfile,
-    JSONRPCErrorError, McpServerElicitationAction, McpServerElicitationRequestResponse,
-    PermissionGrantScope, PermissionsRequestApprovalResponse, RequestId, SandboxMode,
+    CommandExecutionApprovalDecision, CommandExecutionRequestApprovalParams,
+    CommandExecutionRequestApprovalResponse, FileChangeApprovalDecision,
+    FileChangeRequestApprovalParams, FileChangeRequestApprovalResponse, GrantedPermissionProfile,
+    JSONRPCErrorError, McpServerElicitationAction, McpServerElicitationRequest,
+    McpServerElicitationRequestParams, McpServerElicitationRequestResponse, PermissionGrantScope,
+    PermissionsRequestApprovalParams, PermissionsRequestApprovalResponse, RequestId, SandboxMode,
     SandboxPolicy, ServerNotification, ServerRequest, ThreadItem, ThreadResumeParams,
     ThreadResumeResponse, ThreadSource, ThreadStartParams, ThreadStartResponse,
     ToolRequestUserInputParams, ToolRequestUserInputResponse, TurnInterruptParams,
@@ -854,11 +856,246 @@ fn server_request_bridge_payload(
 
 fn server_request_payload_summary(request: &ServerRequest) -> Option<Value> {
     match request {
+        ServerRequest::CommandExecutionRequestApproval { params, .. } => {
+            Some(summarize_command_execution_approval(params))
+        }
+        ServerRequest::FileChangeRequestApproval { params, .. } => {
+            Some(summarize_file_change_approval(params))
+        }
+        ServerRequest::PermissionsRequestApproval { params, .. } => {
+            Some(summarize_permissions_approval(params))
+        }
+        ServerRequest::McpServerElicitationRequest { params, .. } => {
+            Some(summarize_mcp_elicitation_request(params))
+        }
         ServerRequest::ToolRequestUserInput { params, .. } => {
             Some(summarize_tool_request_user_input(params))
         }
         _ => None,
     }
+}
+
+fn summarize_command_execution_approval(params: &CommandExecutionRequestApprovalParams) -> Value {
+    let mut summary = serde_json::Map::new();
+    summary.insert(
+        "requestKind".to_string(),
+        json!("command_execution_approval"),
+    );
+    summary.insert("threadId".to_string(), json!(params.thread_id));
+    summary.insert("turnId".to_string(), json!(params.turn_id));
+    summary.insert("itemId".to_string(), json!(params.item_id));
+    summary.insert("startedAtMs".to_string(), json!(params.started_at_ms));
+    summary.insert(
+        "approvalIdPresent".to_string(),
+        json!(params.approval_id.is_some()),
+    );
+    summary.insert(
+        "environmentPresent".to_string(),
+        json!(params.environment_id.is_some()),
+    );
+    insert_bounded_text_option(
+        &mut summary,
+        "reasonPreview",
+        "reasonPreviewTruncated",
+        params.reason.as_deref(),
+        512,
+    );
+    if let Some(command) = params.command.as_deref() {
+        summary.insert("commandPresent".to_string(), json!(true));
+        summary.insert("commandByteCount".to_string(), json!(command.len()));
+        summary.insert(
+            "commandLineCount".to_string(),
+            json!(command.lines().count()),
+        );
+    } else {
+        summary.insert("commandPresent".to_string(), json!(false));
+    }
+    summary.insert("cwdPresent".to_string(), json!(params.cwd.is_some()));
+    summary.insert(
+        "networkApprovalContextPresent".to_string(),
+        json!(params.network_approval_context.is_some()),
+    );
+    summary.insert(
+        "additionalPermissionsRequested".to_string(),
+        json!(params.additional_permissions.is_some()),
+    );
+    summary.insert(
+        "proposedExecpolicyAmendmentPresent".to_string(),
+        json!(params.proposed_execpolicy_amendment.is_some()),
+    );
+    summary.insert(
+        "proposedNetworkPolicyAmendmentCount".to_string(),
+        json!(
+            params
+                .proposed_network_policy_amendments
+                .as_ref()
+                .map_or(0, Vec::len)
+        ),
+    );
+    summary.insert(
+        "availableDecisionCount".to_string(),
+        json!(params.available_decisions.as_ref().map_or(0, Vec::len)),
+    );
+    if let Some(actions) = params.command_actions.as_ref() {
+        summary.insert("commandActionCount".to_string(), json!(actions.len()));
+        let action_types = actions
+            .iter()
+            .take(8)
+            .filter_map(serialized_type_field)
+            .map(|value| {
+                let (value, truncated) = bounded_text(&value, 80);
+                json!({
+                    "type": value,
+                    "truncated": truncated,
+                })
+            })
+            .collect::<Vec<_>>();
+        summary.insert("commandActionTypes".to_string(), json!(action_types));
+        summary.insert(
+            "commandActionTypesTruncated".to_string(),
+            json!(actions.len() > 8),
+        );
+    }
+    Value::Object(summary)
+}
+
+fn summarize_file_change_approval(params: &FileChangeRequestApprovalParams) -> Value {
+    let mut summary = serde_json::Map::new();
+    summary.insert("requestKind".to_string(), json!("file_change_approval"));
+    summary.insert("threadId".to_string(), json!(params.thread_id));
+    summary.insert("turnId".to_string(), json!(params.turn_id));
+    summary.insert("itemId".to_string(), json!(params.item_id));
+    summary.insert("startedAtMs".to_string(), json!(params.started_at_ms));
+    insert_bounded_text_option(
+        &mut summary,
+        "reasonPreview",
+        "reasonPreviewTruncated",
+        params.reason.as_deref(),
+        512,
+    );
+    summary.insert(
+        "grantRootPresent".to_string(),
+        json!(params.grant_root.is_some()),
+    );
+    Value::Object(summary)
+}
+
+fn summarize_permissions_approval(params: &PermissionsRequestApprovalParams) -> Value {
+    let mut summary = serde_json::Map::new();
+    summary.insert("requestKind".to_string(), json!("permissions_approval"));
+    summary.insert("threadId".to_string(), json!(params.thread_id));
+    summary.insert("turnId".to_string(), json!(params.turn_id));
+    summary.insert("itemId".to_string(), json!(params.item_id));
+    summary.insert("startedAtMs".to_string(), json!(params.started_at_ms));
+    summary.insert(
+        "environmentPresent".to_string(),
+        json!(params.environment_id.is_some()),
+    );
+    summary.insert("cwdPresent".to_string(), json!(true));
+    insert_bounded_text_option(
+        &mut summary,
+        "reasonPreview",
+        "reasonPreviewTruncated",
+        params.reason.as_deref(),
+        512,
+    );
+    let permissions = serde_json::to_value(&params.permissions).unwrap_or_else(|_| json!({}));
+    summary.insert(
+        "networkPermissionsRequested".to_string(),
+        json!(
+            permissions
+                .get("network")
+                .is_some_and(|value| !value.is_null())
+        ),
+    );
+    summary.insert(
+        "fileSystemPermissionsRequested".to_string(),
+        json!(
+            permissions
+                .get("fileSystem")
+                .is_some_and(|value| !value.is_null())
+        ),
+    );
+    Value::Object(summary)
+}
+
+fn summarize_mcp_elicitation_request(params: &McpServerElicitationRequestParams) -> Value {
+    let mut summary = serde_json::Map::new();
+    summary.insert("requestKind".to_string(), json!("mcp_elicitation"));
+    summary.insert("threadId".to_string(), json!(params.thread_id));
+    summary.insert("turnId".to_string(), json!(params.turn_id));
+    let (server_name, server_name_truncated) = bounded_text(&params.server_name, 160);
+    summary.insert("serverName".to_string(), json!(server_name));
+    summary.insert(
+        "serverNameTruncated".to_string(),
+        json!(server_name_truncated),
+    );
+    match &params.request {
+        McpServerElicitationRequest::Form {
+            message,
+            requested_schema,
+            ..
+        } => {
+            summary.insert("mode".to_string(), json!("form"));
+            insert_bounded_text_option(
+                &mut summary,
+                "messagePreview",
+                "messagePreviewTruncated",
+                Some(message.as_str()),
+                512,
+            );
+            summary.insert(
+                "schemaPropertyCount".to_string(),
+                json!(requested_schema.properties.len()),
+            );
+            summary.insert(
+                "schemaRequiredCount".to_string(),
+                json!(requested_schema.required.as_ref().map_or(0, Vec::len)),
+            );
+        }
+        McpServerElicitationRequest::OpenAiForm {
+            message,
+            requested_schema,
+            ..
+        } => {
+            summary.insert("mode".to_string(), json!("openai/form"));
+            insert_bounded_text_option(
+                &mut summary,
+                "messagePreview",
+                "messagePreviewTruncated",
+                Some(message.as_str()),
+                512,
+            );
+            summary.insert(
+                "schemaFieldCount".to_string(),
+                json!(json_object_field_count(requested_schema)),
+            );
+        }
+        McpServerElicitationRequest::Url {
+            message,
+            url,
+            elicitation_id,
+            ..
+        } => {
+            summary.insert("mode".to_string(), json!("url"));
+            insert_bounded_text_option(
+                &mut summary,
+                "messagePreview",
+                "messagePreviewTruncated",
+                Some(message.as_str()),
+                512,
+            );
+            if let Some((preview, truncated)) = safe_url_preview(url, 512) {
+                summary.insert("urlPreview".to_string(), json!(preview));
+                summary.insert("urlPreviewTruncated".to_string(), json!(truncated));
+            }
+            summary.insert(
+                "elicitationIdPresent".to_string(),
+                json!(!elicitation_id.trim().is_empty()),
+            );
+        }
+    }
+    Value::Object(summary)
 }
 
 fn summarize_tool_request_user_input(params: &ToolRequestUserInputParams) -> Value {
@@ -949,6 +1186,37 @@ fn summarize_tool_request_user_input(params: &ToolRequestUserInputParams) -> Val
         json!(params.questions.len() > 3),
     );
     Value::Object(summary)
+}
+
+fn insert_bounded_text_option(
+    summary: &mut serde_json::Map<String, Value>,
+    value_key: &str,
+    truncated_key: &str,
+    value: Option<&str>,
+    max_chars: usize,
+) {
+    let Some(value) = value else {
+        return;
+    };
+    let (value, truncated) = bounded_text(value, max_chars);
+    if value.trim().is_empty() {
+        return;
+    }
+    summary.insert(value_key.to_string(), json!(value));
+    summary.insert(truncated_key.to_string(), json!(truncated));
+}
+
+fn serialized_type_field<T: Serialize>(value: &T) -> Option<String> {
+    serde_json::to_value(value).ok().and_then(|value| {
+        value
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
+}
+
+fn json_object_field_count(value: &Value) -> usize {
+    value.as_object().map_or(0, serde_json::Map::len)
 }
 
 fn notification_method_name(notification: &ServerNotification) -> String {
@@ -3816,6 +4084,95 @@ mod tests {
         assert_eq!(payload["autoApprovedByProductPolicy"], true);
         assert_eq!(payload["serverRequestCount"], 2);
         assert_eq!(payload["eventCount"], 11);
+    }
+
+    #[test]
+    fn server_request_payload_summary_keeps_approval_shape_without_raw_command() {
+        let request = ServerRequest::CommandExecutionRequestApproval {
+            request_id: RequestId::Integer(42),
+            params: CommandExecutionRequestApprovalParams {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                item_id: "item-1".to_string(),
+                started_at_ms: 123,
+                approval_id: Some("approval-1".to_string()),
+                environment_id: Some("env-1".to_string()),
+                reason: Some(format!("{}{}", "needs network ", "r".repeat(700))),
+                network_approval_context: None,
+                command: Some("cat ~/.codex/auth.json".to_string()),
+                cwd: None,
+                command_actions: None,
+                additional_permissions: None,
+                proposed_execpolicy_amendment: None,
+                proposed_network_policy_amendments: None,
+                available_decisions: Some(vec![
+                    CommandExecutionApprovalDecision::AcceptForSession,
+                    CommandExecutionApprovalDecision::Decline,
+                ]),
+            },
+        };
+
+        let summary = server_request_payload_summary(&request).expect("summary");
+
+        assert_eq!(summary["requestKind"], "command_execution_approval");
+        assert_eq!(summary["threadId"], "thread-1");
+        assert_eq!(summary["turnId"], "turn-1");
+        assert_eq!(summary["itemId"], "item-1");
+        assert_eq!(summary["startedAtMs"], 123);
+        assert_eq!(summary["approvalIdPresent"], true);
+        assert_eq!(summary["environmentPresent"], true);
+        assert_eq!(summary["commandPresent"], true);
+        assert_eq!(summary["commandByteCount"], 22);
+        assert_eq!(summary["commandLineCount"], 1);
+        assert_eq!(summary["availableDecisionCount"], 2);
+        assert_eq!(
+            summary["reasonPreview"].as_str().unwrap().chars().count(),
+            512
+        );
+        assert_eq!(summary["reasonPreviewTruncated"], true);
+        assert!(summary.get("command").is_none());
+        assert!(!summary.to_string().contains("auth.json"));
+    }
+
+    #[test]
+    fn server_request_payload_summary_keeps_mcp_elicitation_shape_without_raw_schema() {
+        let request = ServerRequest::McpServerElicitationRequest {
+            request_id: RequestId::String("mcp-request-1".to_string()),
+            params: McpServerElicitationRequestParams {
+                thread_id: "thread-1".to_string(),
+                turn_id: Some("turn-1".to_string()),
+                server_name: "github".to_string(),
+                request: McpServerElicitationRequest::Url {
+                    meta: Some(json!({"secret": "hidden"})),
+                    message: format!("{}{}", "Open provider form ", "m".repeat(700)),
+                    url: "https://github.com/login/oauth/authorize?token=secret#frag".to_string(),
+                    elicitation_id: "elicitation-1".to_string(),
+                },
+            },
+        };
+
+        let summary = server_request_payload_summary(&request).expect("summary");
+
+        assert_eq!(summary["requestKind"], "mcp_elicitation");
+        assert_eq!(summary["threadId"], "thread-1");
+        assert_eq!(summary["turnId"], "turn-1");
+        assert_eq!(summary["serverName"], "github");
+        assert_eq!(summary["mode"], "url");
+        assert_eq!(
+            summary["urlPreview"],
+            "https://github.com/login/oauth/authorize"
+        );
+        assert_eq!(summary["urlPreviewTruncated"], false);
+        assert_eq!(summary["elicitationIdPresent"], true);
+        assert_eq!(
+            summary["messagePreview"].as_str().unwrap().chars().count(),
+            512
+        );
+        assert_eq!(summary["messagePreviewTruncated"], true);
+        assert!(summary.get("url").is_none());
+        assert!(summary.get("_meta").is_none());
+        assert!(!summary.to_string().contains("token=secret"));
+        assert!(!summary.to_string().contains("hidden"));
     }
 
     #[test]
