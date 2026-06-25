@@ -16,8 +16,8 @@ use codex_app_server_protocol::{
     PermissionGrantScope, PermissionsRequestApprovalResponse, RequestId, SandboxMode,
     SandboxPolicy, ServerNotification, ServerRequest, ThreadItem, ThreadResumeParams,
     ThreadResumeResponse, ThreadSource, ThreadStartParams, ThreadStartResponse,
-    TurnInterruptParams, TurnInterruptResponse, TurnStartParams, TurnStartResponse, TurnStatus,
-    TurnSteerParams, TurnSteerResponse, UserInput,
+    ToolRequestUserInputParams, TurnInterruptParams, TurnInterruptResponse, TurnStartParams,
+    TurnStartResponse, TurnStatus, TurnSteerParams, TurnSteerResponse, UserInput,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -508,6 +508,7 @@ async fn handle_event(
             accumulator.server_request_count += 1;
             let method = server_request_method_name(&request);
             let server_request_id = server_request_id_string(&request);
+            let request_summary = server_request_payload_summary(&request);
             if auto_resolve_server_request(client, request).await? {
                 accumulator.auto_approved_request_count += 1;
                 if let Some(bridge) = bridge {
@@ -517,6 +518,7 @@ async fn handle_event(
                             &server_request_id,
                             turn_id,
                             true,
+                            request_summary.as_ref(),
                             accumulator.server_request_count,
                             accumulator.event_count,
                         )
@@ -529,6 +531,7 @@ async fn handle_event(
                         &server_request_id,
                         turn_id,
                         false,
+                        request_summary.as_ref(),
                         accumulator.server_request_count,
                         accumulator.event_count,
                     )
@@ -619,6 +622,7 @@ impl BridgeForwarder {
         server_request_id: &str,
         codex_turn_id: &str,
         auto_approved: bool,
+        request_summary: Option<&Value>,
         server_request_count: u64,
         event_count: u64,
     ) {
@@ -628,6 +632,7 @@ impl BridgeForwarder {
             codex_turn_id,
             auto_approved,
             self.product_turn_id.as_deref(),
+            request_summary,
             server_request_count,
             event_count,
         );
@@ -757,10 +762,11 @@ fn server_request_bridge_payload(
     codex_turn_id: &str,
     auto_approved: bool,
     product_turn_id: Option<&str>,
+    request_summary: Option<&Value>,
     server_request_count: u64,
     event_count: u64,
 ) -> Value {
-    json!({
+    let mut payload = json!({
         "source": "semaphore-codex-runner",
         "sourceKind": "server_request",
         "message": format!("Codex server request: {method}"),
@@ -772,7 +778,110 @@ fn server_request_bridge_payload(
         "autoApprovedByProductPolicy": auto_approved,
         "serverRequestCount": server_request_count,
         "eventCount": event_count,
-    })
+    });
+    if let Some(summary) = request_summary {
+        payload["payloadSummary"] = summary.clone();
+    }
+    payload
+}
+
+fn server_request_payload_summary(request: &ServerRequest) -> Option<Value> {
+    match request {
+        ServerRequest::ToolRequestUserInput { params, .. } => {
+            Some(summarize_tool_request_user_input(params))
+        }
+        _ => None,
+    }
+}
+
+fn summarize_tool_request_user_input(params: &ToolRequestUserInputParams) -> Value {
+    let mut summary = serde_json::Map::new();
+    summary.insert("requestKind".to_string(), json!("request_user_input"));
+    summary.insert("threadId".to_string(), json!(params.thread_id));
+    summary.insert("turnId".to_string(), json!(params.turn_id));
+    summary.insert("itemId".to_string(), json!(params.item_id));
+    summary.insert("questionCount".to_string(), json!(params.questions.len()));
+    if let Some(ms) = params.auto_resolution_ms {
+        summary.insert("autoResolutionMs".to_string(), json!(ms));
+    }
+    let option_count: usize = params
+        .questions
+        .iter()
+        .map(|question| question.options.as_ref().map_or(0, Vec::len))
+        .sum();
+    let sensitive_count = params
+        .questions
+        .iter()
+        .filter(|question| question.is_secret)
+        .count();
+    let other_allowed_count = params
+        .questions
+        .iter()
+        .filter(|question| question.is_other)
+        .count();
+    summary.insert("optionCount".to_string(), json!(option_count));
+    summary.insert("sensitiveQuestionCount".to_string(), json!(sensitive_count));
+    summary.insert("otherAllowedCount".to_string(), json!(other_allowed_count));
+
+    let questions = params
+        .questions
+        .iter()
+        .take(3)
+        .map(|question| {
+            let mut value = serde_json::Map::new();
+            let (id, id_truncated) = bounded_text(&question.id, 160);
+            value.insert("id".to_string(), json!(id));
+            value.insert("idTruncated".to_string(), json!(id_truncated));
+            let (header, header_truncated) = bounded_text(&question.header, 80);
+            value.insert("headerPreview".to_string(), json!(header));
+            value.insert(
+                "headerPreviewTruncated".to_string(),
+                json!(header_truncated),
+            );
+            let (text, text_truncated) = bounded_text(&question.question, 512);
+            value.insert("questionPreview".to_string(), json!(text));
+            value.insert(
+                "questionPreviewTruncated".to_string(),
+                json!(text_truncated),
+            );
+            value.insert(
+                "requiresSensitiveInput".to_string(),
+                json!(question.is_secret),
+            );
+            value.insert("allowsOther".to_string(), json!(question.is_other));
+            if let Some(options) = question.options.as_ref() {
+                value.insert("optionCount".to_string(), json!(options.len()));
+                let option_previews = options
+                    .iter()
+                    .take(4)
+                    .map(|option| {
+                        let mut option_value = serde_json::Map::new();
+                        let (label, label_truncated) = bounded_text(&option.label, 80);
+                        option_value.insert("labelPreview".to_string(), json!(label));
+                        option_value
+                            .insert("labelPreviewTruncated".to_string(), json!(label_truncated));
+                        let (description, description_truncated) =
+                            bounded_text(&option.description, 240);
+                        option_value.insert("descriptionPreview".to_string(), json!(description));
+                        option_value.insert(
+                            "descriptionPreviewTruncated".to_string(),
+                            json!(description_truncated),
+                        );
+                        Value::Object(option_value)
+                    })
+                    .collect::<Vec<_>>();
+                value.insert("options".to_string(), json!(option_previews));
+                value.insert("optionsTruncated".to_string(), json!(options.len() > 4));
+            }
+            Value::Object(value)
+        })
+        .collect::<Vec<_>>();
+    summary.insert("questions".to_string(), json!(questions));
+    summary.insert(
+        "questionsTruncated".to_string(),
+        json!(params.questions.len() > 3),
+    );
+    Value::Object(summary)
 }
 
 fn notification_method_name(notification: &ServerNotification) -> String {
@@ -1962,8 +2071,8 @@ fn request_id_string(request_id: &RequestId) -> String {
 #[cfg(test)]
 mod tests {
     use codex_app_server_protocol::{
-        CommandExecutionOutputDeltaNotification, CurrentTimeReadParams, Turn, TurnItemsView,
-        TurnStartedNotification,
+        CommandExecutionOutputDeltaNotification, CurrentTimeReadParams, ToolRequestUserInputOption,
+        ToolRequestUserInputQuestion, Turn, TurnItemsView, TurnStartedNotification,
     };
 
     use super::*;
@@ -2719,6 +2828,7 @@ mod tests {
             "codex-turn-1",
             true,
             Some("product-turn-1"),
+            None,
             2,
             11,
         );
@@ -2732,6 +2842,89 @@ mod tests {
         assert_eq!(payload["autoApprovedByProductPolicy"], true);
         assert_eq!(payload["serverRequestCount"], 2);
         assert_eq!(payload["eventCount"], 11);
+    }
+
+    #[test]
+    fn server_request_bridge_payload_keeps_request_user_input_shape_without_answers() {
+        let request = ServerRequest::ToolRequestUserInput {
+            request_id: RequestId::Integer(7),
+            params: ToolRequestUserInputParams {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                item_id: "item-1".to_string(),
+                questions: vec![
+                    ToolRequestUserInputQuestion {
+                        id: "repo_choice".to_string(),
+                        header: "Repository".to_string(),
+                        question: format!("{}{}", "Which repo should I inspect? ", "q".repeat(700)),
+                        is_other: true,
+                        is_secret: false,
+                        options: Some(vec![
+                            ToolRequestUserInputOption {
+                                label: "test-repo".to_string(),
+                                description: "React fixture".to_string(),
+                            },
+                            ToolRequestUserInputOption {
+                                label: "test-repo-2".to_string(),
+                                description: "Django fixture".to_string(),
+                            },
+                        ]),
+                    },
+                    ToolRequestUserInputQuestion {
+                        id: "token".to_string(),
+                        header: "Credential".to_string(),
+                        question: "Paste a short-lived token".to_string(),
+                        is_other: false,
+                        is_secret: true,
+                        options: None,
+                    },
+                ],
+                auto_resolution_ms: Some(60_000),
+            },
+        };
+        let summary = server_request_payload_summary(&request).expect("summary");
+        let payload = server_request_bridge_payload(
+            "item/tool/requestUserInput",
+            "7",
+            "codex-turn-1",
+            false,
+            Some("product-turn-1"),
+            Some(&summary),
+            1,
+            9,
+        );
+
+        assert_eq!(payload["serverRequestMethod"], "item/tool/requestUserInput");
+        assert_eq!(
+            payload["payloadSummary"]["requestKind"],
+            "request_user_input"
+        );
+        assert_eq!(payload["payloadSummary"]["threadId"], "thread-1");
+        assert_eq!(payload["payloadSummary"]["turnId"], "turn-1");
+        assert_eq!(payload["payloadSummary"]["itemId"], "item-1");
+        assert_eq!(payload["payloadSummary"]["questionCount"], 2);
+        assert_eq!(payload["payloadSummary"]["optionCount"], 2);
+        assert_eq!(payload["payloadSummary"]["sensitiveQuestionCount"], 1);
+        assert_eq!(payload["payloadSummary"]["otherAllowedCount"], 1);
+        assert_eq!(payload["payloadSummary"]["autoResolutionMs"], 60_000);
+        assert_eq!(
+            payload["payloadSummary"]["questions"][0]["questionPreview"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            512
+        );
+        assert_eq!(
+            payload["payloadSummary"]["questions"][0]["questionPreviewTruncated"],
+            true
+        );
+        assert_eq!(
+            payload["payloadSummary"]["questions"][0]["options"][0]["labelPreview"],
+            "test-repo"
+        );
+        assert!(payload["payloadSummary"].get("answers").is_none());
+        assert!(payload["payloadSummary"].get("params").is_none());
     }
 
     #[test]
