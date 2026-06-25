@@ -16,11 +16,11 @@ use codex_app_server_protocol::{
     JSONRPCErrorError, McpServerElicitationAction, McpServerElicitationRequest,
     McpServerElicitationRequestParams, McpServerElicitationRequestResponse, PermissionGrantScope,
     PermissionsRequestApprovalParams, PermissionsRequestApprovalResponse, RequestId, SandboxMode,
-    SandboxPolicy, ServerNotification, ServerRequest, ThreadItem, ThreadResumeParams,
-    ThreadResumeResponse, ThreadSource, ThreadStartParams, ThreadStartResponse,
-    ToolRequestUserInputParams, ToolRequestUserInputResponse, TurnInterruptParams,
-    TurnInterruptResponse, TurnStartParams, TurnStartResponse, TurnStatus, TurnSteerParams,
-    TurnSteerResponse, UserInput,
+    SandboxPolicy, ServerNotification, ServerRequest, ThreadItem,
+    ThreadResumeInitialTurnsPageParams, ThreadResumeParams, ThreadResumeResponse, ThreadSource,
+    ThreadStartParams, ThreadStartResponse, ToolRequestUserInputParams,
+    ToolRequestUserInputResponse, TurnInterruptParams, TurnInterruptResponse, TurnItemsView,
+    TurnStartParams, TurnStartResponse, TurnStatus, TurnSteerParams, TurnSteerResponse, UserInput,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -33,6 +33,8 @@ const DEFAULT_MODEL: &str = "gpt-5-codex";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 1200;
 const BRIDGE_SCHEMA_VERSION: i32 = 1;
 const BRIDGE_REQUEST_TIMEOUT_SECONDS: u64 = 2;
+const RESUME_HISTORY_TURN_LIMIT: u32 = 8;
+const RESUME_HISTORY_COUNT_LIMIT: usize = 12;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Semaphore runner for Codex app-server turns")]
@@ -236,6 +238,12 @@ async fn run_turn(command: TurnCommand) -> Result<()> {
     };
 
     let thread = ensure_thread(&client, &mut request_ids, &command, cwd_string.clone()).await?;
+    if let (Some(bridge), Some(summary)) = (bridge.as_mut(), thread.history_replay_summary.as_ref())
+    {
+        bridge
+            .forward_thread_history_replay(&thread.id, summary)
+            .await;
+    }
 
     let mut responsesapi_client_metadata = HashMap::from([
         (
@@ -348,6 +356,7 @@ struct PreparedThread {
     session_id: String,
     reused: bool,
     mode: &'static str,
+    history_replay_summary: Option<Value>,
 }
 
 async fn ensure_thread(
@@ -367,16 +376,23 @@ async fn ensure_thread(
                     approval_policy: Some(AskForApproval::Never),
                     approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
                     sandbox: Some(SandboxMode::DangerFullAccess),
+                    initial_turns_page: Some(ThreadResumeInitialTurnsPageParams {
+                        limit: Some(RESUME_HISTORY_TURN_LIMIT),
+                        sort_direction: None,
+                        items_view: Some(TurnItemsView::Summary),
+                    }),
                     ..ThreadResumeParams::default()
                 },
             })
             .await
             .context("thread/resume failed")?;
+        let history_replay_summary = thread_history_replay_summary(&resumed);
         return Ok(PreparedThread {
             id: resumed.thread.id,
             session_id: resumed.thread.session_id,
             reused: true,
             mode: "resume_existing",
+            history_replay_summary: Some(history_replay_summary),
         });
     }
 
@@ -403,6 +419,7 @@ async fn ensure_thread(
         session_id: started.thread.session_id,
         reused: false,
         mode: "start_new",
+        history_replay_summary: None,
     })
 }
 
@@ -714,6 +731,20 @@ impl BridgeForwarder {
         }
     }
 
+    async fn forward_thread_history_replay(&mut self, thread_id: &str, summary: &Value) {
+        let payload = thread_history_replay_bridge_payload(
+            thread_id,
+            self.product_turn_id.as_deref(),
+            summary,
+        );
+        if let Err(error) = self.post_event("codex.notification", payload).await {
+            tracing::warn!(
+                error = %error,
+                "failed to forward Codex thread history replay through sandbox bridge"
+            );
+        }
+    }
+
     async fn post_event(&mut self, event_type: &str, payload: Value) -> Result<()> {
         let sequence = self.sequence;
         self.sequence += 1;
@@ -852,6 +883,215 @@ fn server_request_bridge_payload(
         payload["payloadSummary"] = summary.clone();
     }
     payload
+}
+
+fn thread_history_replay_bridge_payload(
+    thread_id: &str,
+    product_turn_id: Option<&str>,
+    summary: &Value,
+) -> Value {
+    json!({
+        "source": "semaphore-codex-runner",
+        "sourceKind": "thread_history_replay",
+        "message": "Codex thread history replay verified",
+        "notificationMethod": "thread/history/replayed",
+        "productTurnId": product_turn_id,
+        "threadId": thread_id,
+        "payloadSummary": summary,
+    })
+}
+
+fn thread_history_replay_summary(response: &ThreadResumeResponse) -> Value {
+    let (turn_values, page_returned, next_cursor_present, backwards_cursor_present) =
+        if let Some(page) = response.initial_turns_page.as_ref() {
+            (
+                serialized_turn_values(&page.data),
+                true,
+                page.next_cursor.is_some(),
+                page.backwards_cursor.is_some(),
+            )
+        } else {
+            (
+                serialized_turn_values(&response.thread.turns),
+                false,
+                false,
+                false,
+            )
+        };
+    thread_history_replay_summary_from_values(
+        &response.thread.id,
+        &response.thread.session_id,
+        page_returned,
+        next_cursor_present,
+        backwards_cursor_present,
+        &turn_values,
+    )
+}
+
+fn serialized_turn_values(turns: &[codex_app_server_protocol::Turn]) -> Vec<Value> {
+    turns
+        .iter()
+        .filter_map(|turn| serde_json::to_value(turn).ok())
+        .collect()
+}
+
+fn thread_history_replay_summary_from_values(
+    thread_id: &str,
+    codex_session_id: &str,
+    page_returned: bool,
+    next_cursor_present: bool,
+    backwards_cursor_present: bool,
+    turns: &[Value],
+) -> Value {
+    let item_values = replay_item_values(turns);
+    let mut summary = serde_json::Map::new();
+    summary.insert("threadId".to_string(), json!(thread_id));
+    summary.insert("codexSessionId".to_string(), json!(codex_session_id));
+    summary.insert("replayKind".to_string(), json!("resume_initial_turns_page"));
+    summary.insert("pageReturned".to_string(), json!(page_returned));
+    summary.insert("nextCursorPresent".to_string(), json!(next_cursor_present));
+    summary.insert(
+        "backwardsCursorPresent".to_string(),
+        json!(backwards_cursor_present),
+    );
+    summary.insert("turnCount".to_string(), json!(turns.len()));
+    summary.insert("itemCount".to_string(), json!(item_values.len()));
+    summary.insert(
+        "turnsTruncated".to_string(),
+        json!(turns.len() > RESUME_HISTORY_TURN_LIMIT as usize),
+    );
+    summary.insert(
+        "itemKindCounts".to_string(),
+        json!(count_string_values(
+            item_values
+                .iter()
+                .filter_map(|item| item.get("type").and_then(Value::as_str)),
+            RESUME_HISTORY_COUNT_LIMIT,
+            80,
+        )),
+    );
+    summary.insert(
+        "itemStatusCounts".to_string(),
+        json!(count_string_values(
+            item_values
+                .iter()
+                .filter_map(|item| item.get("status").and_then(Value::as_str)),
+            RESUME_HISTORY_COUNT_LIMIT,
+            80,
+        )),
+    );
+    summary.insert(
+        "itemOutcomeCounts".to_string(),
+        json!(count_string_values(
+            item_values
+                .iter()
+                .filter_map(|item| thread_item_outcome(item)),
+            RESUME_HISTORY_COUNT_LIMIT,
+            80,
+        )),
+    );
+    summary.insert(
+        "turns".to_string(),
+        json!(
+            turns
+                .iter()
+                .take(RESUME_HISTORY_TURN_LIMIT as usize)
+                .map(replayed_turn_summary)
+                .collect::<Vec<_>>()
+        ),
+    );
+    Value::Object(summary)
+}
+
+fn replay_item_values(turns: &[Value]) -> Vec<&Value> {
+    turns
+        .iter()
+        .filter_map(|turn| turn.get("items").and_then(Value::as_array))
+        .flat_map(|items| items.iter())
+        .collect()
+}
+
+fn replayed_turn_summary(turn: &Value) -> Value {
+    let items = turn
+        .get("items")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let mut summary = serde_json::Map::new();
+    if let Some(id) = turn.get("id").and_then(Value::as_str) {
+        let (id, truncated) = bounded_text(id, 160);
+        summary.insert("turnId".to_string(), json!(id));
+        if truncated {
+            summary.insert("turnIdTruncated".to_string(), json!(true));
+        }
+    }
+    if let Some(status) = turn.get("status").and_then(Value::as_str) {
+        let (status, truncated) = bounded_text(status, 80);
+        summary.insert("status".to_string(), json!(status));
+        if truncated {
+            summary.insert("statusTruncated".to_string(), json!(true));
+        }
+    }
+    if let Some(items_view) = turn.get("itemsView").and_then(Value::as_str) {
+        let (items_view, truncated) = bounded_text(items_view, 80);
+        summary.insert("itemsView".to_string(), json!(items_view));
+        if truncated {
+            summary.insert("itemsViewTruncated".to_string(), json!(true));
+        }
+    }
+    summary.insert("itemCount".to_string(), json!(items.len()));
+    summary.insert(
+        "itemKindCounts".to_string(),
+        json!(count_string_values(
+            items
+                .iter()
+                .filter_map(|item| item.get("type").and_then(Value::as_str)),
+            RESUME_HISTORY_COUNT_LIMIT,
+            80,
+        )),
+    );
+    summary.insert(
+        "itemOutcomeCounts".to_string(),
+        json!(count_string_values(
+            items.iter().filter_map(thread_item_outcome),
+            RESUME_HISTORY_COUNT_LIMIT,
+            80,
+        )),
+    );
+    Value::Object(summary)
+}
+
+fn count_string_values<'a>(
+    values: impl Iterator<Item = &'a str>,
+    limit: usize,
+    max_label_chars: usize,
+) -> Vec<Value> {
+    let mut counts = HashMap::<String, usize>::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        *counts.entry(value.to_string()).or_default() += 1;
+    }
+    let mut counts = counts.into_iter().collect::<Vec<_>>();
+    counts.sort_by(|(left_label, left_count), (right_label, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_label.cmp(right_label))
+    });
+    counts
+        .into_iter()
+        .take(limit)
+        .map(|(label, count)| {
+            let (label, truncated) = bounded_text(&label, max_label_chars);
+            json!({
+                "value": label,
+                "count": count,
+                "truncated": truncated,
+            })
+        })
+        .collect()
 }
 
 fn server_request_payload_summary(request: &ServerRequest) -> Option<Value> {
@@ -3119,6 +3359,62 @@ mod tests {
             payload["payloadSummary"]["assistantTextDeltaTruncated"],
             true
         );
+    }
+
+    #[test]
+    fn thread_history_replay_summary_counts_without_raw_items() {
+        let turns = vec![json!({
+            "id": "turn-1",
+            "status": "completed",
+            "itemsView": "summary",
+            "items": [
+                {
+                    "type": "commandExecution",
+                    "id": "item-1",
+                    "status": "completed",
+                    "exitCode": 101,
+                    "command": "do not expose this command"
+                },
+                {
+                    "type": "commandExecution",
+                    "id": "item-2",
+                    "status": "inProgress",
+                    "aggregatedOutput": "do not expose this output"
+                }
+            ]
+        })];
+
+        let summary = thread_history_replay_summary_from_values(
+            "thread-1",
+            "session-1",
+            true,
+            true,
+            false,
+            &turns,
+        );
+
+        assert_eq!(summary["replayKind"], "resume_initial_turns_page");
+        assert_eq!(summary["pageReturned"], true);
+        assert_eq!(summary["nextCursorPresent"], true);
+        assert_eq!(summary["turnCount"], 1);
+        assert_eq!(summary["itemCount"], 2);
+        assert_eq!(summary["itemKindCounts"][0]["value"], "commandExecution");
+        assert_eq!(summary["itemKindCounts"][0]["count"], 2);
+        assert_eq!(summary["turns"][0]["turnId"], "turn-1");
+        assert_eq!(summary["turns"][0]["itemsView"], "summary");
+        assert_eq!(summary["turns"][0]["itemCount"], 2);
+        assert!(summary["turns"][0].get("items").is_none());
+
+        let rendered = summary.to_string();
+        assert!(!rendered.contains("do not expose this command"));
+        assert!(!rendered.contains("do not expose this output"));
+
+        let payload =
+            thread_history_replay_bridge_payload("thread-1", Some("product-turn-1"), &summary);
+        assert_eq!(payload["sourceKind"], "thread_history_replay");
+        assert_eq!(payload["notificationMethod"], "thread/history/replayed");
+        assert_eq!(payload["productTurnId"], "product-turn-1");
+        assert_eq!(payload["payloadSummary"]["itemCount"], 2);
     }
 
     #[test]
