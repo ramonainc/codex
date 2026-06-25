@@ -1622,6 +1622,7 @@ fn summarize_thread_item(item: &Value) -> Value {
         1_024,
     );
     insert_image_generation_result_summary(&mut summary, item);
+    insert_screenshot_reference_summary(&mut summary, item);
     insert_i64_field(&mut summary, item, "exitCode", "exitCode");
     insert_i64_field(&mut summary, item, "durationMs", "durationMs");
     if let Some(success) = item.get("success").and_then(Value::as_bool) {
@@ -1825,6 +1826,30 @@ fn insert_image_generation_result_summary(
         summary.insert("resultPreview".to_string(), json!(preview));
         summary.insert("resultPreviewTruncated".to_string(), json!(truncated));
     }
+}
+
+fn insert_screenshot_reference_summary(summary: &mut serde_json::Map<String, Value>, item: &Value) {
+    if !matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("screenshot" | "browserScreenshot" | "appScreenshot")
+    ) {
+        return;
+    }
+    copy_string_field(summary, item, "screenshotPath", "screenshotPath", 512);
+    copy_string_field(summary, item, "filePath", "filePath", 512);
+    insert_safe_url_preview(summary, item, "url", "urlPreview", 512);
+    insert_safe_url_preview(summary, item, "pageUrl", "urlPreview", 512);
+    insert_bounded_optional_string(
+        summary,
+        item,
+        "title",
+        "titlePreview",
+        "titlePreviewTruncated",
+        256,
+    );
+    insert_i64_field(summary, item, "viewportWidth", "viewportWidth");
+    insert_i64_field(summary, item, "viewportHeight", "viewportHeight");
+    insert_i64_field(summary, item, "imageByteCount", "imageByteCount");
 }
 
 fn image_generation_result_kind(value: &str) -> &'static str {
@@ -2406,6 +2431,53 @@ mod tests {
 
         assert_eq!(summary["item"]["resultKind"], "data_url");
         assert!(summary["item"].get("resultPreview").is_none());
+    }
+
+    #[test]
+    fn item_lifecycle_summary_keeps_screenshot_evidence_without_url_secrets() {
+        let summary = notification_payload_summary(&json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "browserScreenshot",
+                    "id": "screenshot-1",
+                    "status": "completed",
+                    "screenshotPath": "/home/daytona/workspace/.semaphore/screenshots/session.png",
+                    "url": "https://example.test/app/session?token=secret#timeline",
+                    "title": format!("{}{}", "Session detail ", "x".repeat(400)),
+                    "viewportWidth": 1440,
+                    "viewportHeight": 900,
+                    "imageByteCount": 24576,
+                    "result": {"raw": "binary payload omitted"}
+                }
+            }
+        }));
+
+        assert_eq!(summary["itemKind"], "browserScreenshot");
+        assert_eq!(summary["item"]["id"], "screenshot-1");
+        assert_eq!(
+            summary["item"]["screenshotPath"],
+            "/home/daytona/workspace/.semaphore/screenshots/session.png"
+        );
+        assert_eq!(
+            summary["item"]["urlPreview"],
+            "https://example.test/app/session"
+        );
+        assert_eq!(
+            summary["item"]["titlePreview"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            256
+        );
+        assert_eq!(summary["item"]["titlePreviewTruncated"], true);
+        assert_eq!(summary["item"]["viewportWidth"], 1440);
+        assert_eq!(summary["item"]["viewportHeight"], 900);
+        assert_eq!(summary["item"]["imageByteCount"], 24576);
+        assert_eq!(summary["item"]["resultPresent"], true);
+        assert!(summary["item"].get("url").is_none());
+        assert!(summary["item"].get("result").is_none());
     }
 
     #[test]
