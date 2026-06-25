@@ -1432,6 +1432,7 @@ fn summarize_thread_item(item: &Value) -> Value {
     copy_string_field(&mut summary, item, "path", "path", 512);
     copy_string_field(&mut summary, item, "savedPath", "savedPath", 512);
     copy_string_field(&mut summary, item, "command", "commandPreview", 512);
+    insert_web_search_summary(&mut summary, item);
     insert_bounded_optional_string(
         &mut summary,
         item,
@@ -1464,6 +1465,109 @@ fn summarize_thread_item(item: &Value) -> Value {
         }
     }
     Value::Object(summary)
+}
+
+fn insert_web_search_summary(summary: &mut serde_json::Map<String, Value>, item: &Value) {
+    if !matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("webSearch" | "web_search")
+    ) {
+        return;
+    }
+
+    insert_bounded_optional_string(
+        summary,
+        item,
+        "query",
+        "queryPreview",
+        "queryPreviewTruncated",
+        512,
+    );
+
+    let Some(action) = item.get("action").filter(|value| !value.is_null()) else {
+        return;
+    };
+    summary.insert("actionPresent".to_string(), json!(true));
+    copy_string_field(summary, action, "type", "actionType", 80);
+
+    match action.get("type").and_then(Value::as_str) {
+        Some("search") => {
+            insert_bounded_optional_string(
+                summary,
+                action,
+                "query",
+                "actionQueryPreview",
+                "actionQueryPreviewTruncated",
+                512,
+            );
+            insert_string_array_summary(
+                summary,
+                action,
+                "queries",
+                "actionQueries",
+                "actionQueryCount",
+                10,
+                256,
+            );
+        }
+        Some("openPage") => {
+            insert_safe_url_preview(summary, action, "url", "actionUrlPreview", 512);
+        }
+        Some("findInPage") => {
+            insert_safe_url_preview(summary, action, "url", "actionUrlPreview", 512);
+            insert_bounded_optional_string(
+                summary,
+                action,
+                "pattern",
+                "actionPatternPreview",
+                "actionPatternPreviewTruncated",
+                256,
+            );
+        }
+        _ => {}
+    }
+}
+
+fn insert_safe_url_preview(
+    summary: &mut serde_json::Map<String, Value>,
+    value: &Value,
+    source_key: &str,
+    output_key: &str,
+    max_chars: usize,
+) {
+    let Some(url) = value.get(source_key).and_then(Value::as_str) else {
+        return;
+    };
+    let Some((preview, truncated)) = safe_url_preview(url, max_chars) else {
+        return;
+    };
+    summary.insert(output_key.to_string(), json!(preview));
+    if truncated {
+        summary.insert(format!("{output_key}Truncated"), json!(true));
+    }
+}
+
+fn safe_url_preview(value: &str, max_chars: usize) -> Option<(String, bool)> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return None;
+    }
+    let lower = value.to_ascii_lowercase();
+    if !lower.starts_with("http://") && !lower.starts_with("https://") {
+        return None;
+    }
+    let after_scheme = value.split_once("://")?.1;
+    let authority = after_scheme.split('/').next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    let without_fragment = value.split('#').next().unwrap_or(value);
+    let without_query = without_fragment.split('?').next().unwrap_or(without_fragment);
+    let preview = without_query.trim_end_matches('/');
+    if preview.is_empty() {
+        return None;
+    }
+    Some(bounded_text(preview, max_chars))
 }
 
 fn insert_image_generation_result_summary(
@@ -2058,6 +2162,95 @@ mod tests {
 
         assert_eq!(summary["item"]["resultKind"], "data_url");
         assert!(summary["item"].get("resultPreview").is_none());
+    }
+
+    #[test]
+    fn item_lifecycle_summary_keeps_web_search_evidence_without_raw_action() {
+        let summary = notification_payload_summary(&json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "webSearch",
+                    "id": "search-1",
+                    "query": format!("{}{}", "release notes ", "x".repeat(600)),
+                    "action": {
+                        "type": "search",
+                        "query": "latest release notes",
+                        "queries": [
+                            "latest release notes",
+                            format!("{}{}", "related ", "y".repeat(400))
+                        ]
+                    }
+                }
+            }
+        }));
+
+        assert_eq!(summary["itemKind"], "webSearch");
+        assert_eq!(summary["item"]["id"], "search-1");
+        assert_eq!(
+            summary["item"]["queryPreview"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            512
+        );
+        assert_eq!(summary["item"]["queryPreviewTruncated"], true);
+        assert_eq!(summary["item"]["actionPresent"], true);
+        assert_eq!(summary["item"]["actionType"], "search");
+        assert_eq!(summary["item"]["actionQueryPreview"], "latest release notes");
+        assert_eq!(summary["item"]["actionQueryCount"], 2);
+        assert_eq!(
+            summary["item"]["actionQueries"][1]["value"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            256
+        );
+        assert_eq!(summary["item"]["actionQueries"][1]["truncated"], true);
+        assert!(summary["item"].get("action").is_none());
+    }
+
+    #[test]
+    fn web_search_url_previews_drop_credentials_queries_and_fragments() {
+        let summary = notification_payload_summary(&json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "webSearch",
+                    "id": "search-2",
+                    "query": "open docs",
+                    "action": {
+                        "type": "openPage",
+                        "url": "https://example.test/docs/page?token=secret#section"
+                    }
+                }
+            }
+        }));
+
+        assert_eq!(
+            summary["item"]["actionUrlPreview"],
+            "https://example.test/docs/page"
+        );
+
+        let unsafe_summary = notification_payload_summary(&json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "webSearch",
+                    "id": "search-3",
+                    "query": "open docs",
+                    "action": {
+                        "type": "openPage",
+                        "url": "https://user:secret@example.test/docs"
+                    }
+                }
+            }
+        }));
+
+        assert!(unsafe_summary["item"].get("actionUrlPreview").is_none());
+        assert_eq!(unsafe_summary["item"]["actionPresent"], true);
     }
 
     #[test]
