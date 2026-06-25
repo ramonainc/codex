@@ -1433,6 +1433,10 @@ fn summarize_thread_item(item: &Value) -> Value {
     copy_string_field(&mut summary, item, "savedPath", "savedPath", 512);
     copy_string_field(&mut summary, item, "command", "commandPreview", 512);
     insert_web_search_summary(&mut summary, item);
+    insert_collab_agent_summary(&mut summary, item);
+    insert_sub_agent_activity_summary(&mut summary, item);
+    insert_review_mode_summary(&mut summary, item);
+    insert_context_compaction_summary(&mut summary, item);
     insert_bounded_optional_string(
         &mut summary,
         item,
@@ -1465,6 +1469,61 @@ fn summarize_thread_item(item: &Value) -> Value {
         }
     }
     Value::Object(summary)
+}
+
+fn insert_collab_agent_summary(summary: &mut serde_json::Map<String, Value>, item: &Value) {
+    if item.get("type").and_then(Value::as_str) != Some("collabAgentToolCall") {
+        return;
+    }
+    copy_string_field(summary, item, "senderThreadId", "senderThreadId", 160);
+    copy_string_field(summary, item, "model", "model", 160);
+    copy_string_field(summary, item, "reasoningEffort", "reasoningEffort", 80);
+    insert_bounded_optional_string(
+        summary,
+        item,
+        "prompt",
+        "promptPreview",
+        "promptPreviewTruncated",
+        1_024,
+    );
+    if let Some(receivers) = item.get("receiverThreadIds").and_then(Value::as_array) {
+        summary.insert("receiverThreadCount".to_string(), json!(receivers.len()));
+    }
+    if let Some(states) = item.get("agentsStates").and_then(Value::as_object) {
+        summary.insert("agentStateCount".to_string(), json!(states.len()));
+    }
+}
+
+fn insert_sub_agent_activity_summary(summary: &mut serde_json::Map<String, Value>, item: &Value) {
+    if item.get("type").and_then(Value::as_str) != Some("subAgentActivity") {
+        return;
+    }
+    copy_string_field(summary, item, "kind", "subAgentKind", 80);
+    copy_string_field(summary, item, "agentThreadId", "agentThreadId", 160);
+    copy_string_field(summary, item, "agentPath", "agentPath", 512);
+}
+
+fn insert_review_mode_summary(summary: &mut serde_json::Map<String, Value>, item: &Value) {
+    if !matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("enteredReviewMode" | "exitedReviewMode")
+    ) {
+        return;
+    }
+    insert_bounded_optional_string(
+        summary,
+        item,
+        "review",
+        "reviewPreview",
+        "reviewPreviewTruncated",
+        1_024,
+    );
+}
+
+fn insert_context_compaction_summary(summary: &mut serde_json::Map<String, Value>, item: &Value) {
+    if item.get("type").and_then(Value::as_str) == Some("contextCompaction") {
+        summary.insert("contextCompaction".to_string(), json!(true));
+    }
 }
 
 fn insert_web_search_summary(summary: &mut serde_json::Map<String, Value>, item: &Value) {
@@ -1562,7 +1621,10 @@ fn safe_url_preview(value: &str, max_chars: usize) -> Option<(String, bool)> {
         return None;
     }
     let without_fragment = value.split('#').next().unwrap_or(value);
-    let without_query = without_fragment.split('?').next().unwrap_or(without_fragment);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
     let preview = without_query.trim_end_matches('/');
     if preview.is_empty() {
         return None;
@@ -2198,7 +2260,10 @@ mod tests {
         assert_eq!(summary["item"]["queryPreviewTruncated"], true);
         assert_eq!(summary["item"]["actionPresent"], true);
         assert_eq!(summary["item"]["actionType"], "search");
-        assert_eq!(summary["item"]["actionQueryPreview"], "latest release notes");
+        assert_eq!(
+            summary["item"]["actionQueryPreview"],
+            "latest release notes"
+        );
         assert_eq!(summary["item"]["actionQueryCount"], 2);
         assert_eq!(
             summary["item"]["actionQueries"][1]["value"]
@@ -2251,6 +2316,108 @@ mod tests {
 
         assert!(unsafe_summary["item"].get("actionUrlPreview").is_none());
         assert_eq!(unsafe_summary["item"]["actionPresent"], true);
+    }
+
+    #[test]
+    fn item_lifecycle_summary_keeps_collab_agent_shape_without_raw_prompt() {
+        let summary = notification_payload_summary(&json!({
+            "method": "item/started",
+            "params": {
+                "item": {
+                    "type": "collabAgentToolCall",
+                    "id": "collab-1",
+                    "tool": "spawn",
+                    "status": "inProgress",
+                    "senderThreadId": "thread-parent",
+                    "receiverThreadIds": ["thread-child-1", "thread-child-2"],
+                    "prompt": format!("{}{}", "inspect failing test ", "x".repeat(1_200)),
+                    "model": "gpt-5-codex",
+                    "reasoningEffort": "high",
+                    "agentsStates": {
+                        "thread-child-1": {"status": "running"},
+                        "thread-child-2": {"status": "queued"}
+                    }
+                }
+            }
+        }));
+
+        assert_eq!(summary["itemKind"], "collabAgentToolCall");
+        assert_eq!(summary["itemStatus"], "inProgress");
+        assert_eq!(summary["item"]["tool"], "spawn");
+        assert_eq!(summary["item"]["senderThreadId"], "thread-parent");
+        assert_eq!(summary["item"]["receiverThreadCount"], 2);
+        assert_eq!(summary["item"]["agentStateCount"], 2);
+        assert_eq!(summary["item"]["model"], "gpt-5-codex");
+        assert_eq!(summary["item"]["reasoningEffort"], "high");
+        assert_eq!(
+            summary["item"]["promptPreview"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            1_024
+        );
+        assert_eq!(summary["item"]["promptPreviewTruncated"], true);
+        assert!(summary["item"].get("prompt").is_none());
+        assert!(summary["item"].get("receiverThreadIds").is_none());
+        assert!(summary["item"].get("agentsStates").is_none());
+    }
+
+    #[test]
+    fn item_lifecycle_summary_keeps_sub_agent_review_and_compaction_shape() {
+        let sub_agent = notification_payload_summary(&json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "subAgentActivity",
+                    "id": "activity-1",
+                    "kind": "handoff",
+                    "agentThreadId": "thread-child",
+                    "agentPath": "/agents/runtime-reviewer"
+                }
+            }
+        }));
+
+        assert_eq!(sub_agent["itemKind"], "subAgentActivity");
+        assert_eq!(sub_agent["item"]["subAgentKind"], "handoff");
+        assert_eq!(sub_agent["item"]["agentThreadId"], "thread-child");
+        assert_eq!(sub_agent["item"]["agentPath"], "/agents/runtime-reviewer");
+
+        let review = notification_payload_summary(&json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "enteredReviewMode",
+                    "id": "review-1",
+                    "review": format!("{}{}", "review summary ", "r".repeat(1_300))
+                }
+            }
+        }));
+
+        assert_eq!(review["itemKind"], "enteredReviewMode");
+        assert_eq!(
+            review["item"]["reviewPreview"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            1_024
+        );
+        assert_eq!(review["item"]["reviewPreviewTruncated"], true);
+        assert!(review["item"].get("review").is_none());
+
+        let compaction = notification_payload_summary(&json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "contextCompaction",
+                    "id": "compact-1"
+                }
+            }
+        }));
+
+        assert_eq!(compaction["itemKind"], "contextCompaction");
+        assert_eq!(compaction["item"]["contextCompaction"], true);
     }
 
     #[test]
