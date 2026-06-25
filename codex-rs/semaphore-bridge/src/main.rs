@@ -813,10 +813,11 @@ async fn handle_bridge_command(
                 Err(error)
             }
         },
-        "turn.steer" | "turn.interrupt" => match execute_turn_control_command(&command).await {
-            Ok(result) => {
-                let product_turn_id = command_payload_string(&command, "productTurnId");
-                send_bridge_status_event(
+        "turn.steer" | "turn.interrupt" | "server_request.respond" => {
+            match execute_turn_control_command(&command).await {
+                Ok(result) => {
+                    let product_turn_id = command_payload_string(&command, "productTurnId");
+                    send_bridge_status_event(
                     args,
                     transport,
                     spool,
@@ -835,29 +836,30 @@ async fn handle_bridge_command(
                 )
                 .await
                 .map(|_| ())
+                }
+                Err(error) => {
+                    send_bridge_status_event(
+                        args,
+                        transport,
+                        spool,
+                        bridge_epoch,
+                        sequence,
+                        "bridge.command_failed",
+                        json!({
+                            "source": "semaphore-sandbox-bridge",
+                            "message": format!("Bridge command failed: {}", command.command_type),
+                            "bridgeCommandId": command.id,
+                            "commandType": command.command_type,
+                            "productTurnId": command_payload_string(&command, "productTurnId"),
+                            "error": error.to_string(),
+                        }),
+                        true,
+                    )
+                    .await?;
+                    Err(error)
+                }
             }
-            Err(error) => {
-                send_bridge_status_event(
-                    args,
-                    transport,
-                    spool,
-                    bridge_epoch,
-                    sequence,
-                    "bridge.command_failed",
-                    json!({
-                        "source": "semaphore-sandbox-bridge",
-                        "message": format!("Bridge command failed: {}", command.command_type),
-                        "bridgeCommandId": command.id,
-                        "commandType": command.command_type,
-                        "productTurnId": command_payload_string(&command, "productTurnId"),
-                        "error": error.to_string(),
-                    }),
-                    true,
-                )
-                .await?;
-                Err(error)
-            }
-        },
+        }
         other => {
             send_bridge_status_event(
                 args,
@@ -1107,7 +1109,7 @@ async fn handle_active_turn_control_command(
     .await?;
     if !matches!(
         command.command_type.as_str(),
-        "turn.steer" | "turn.interrupt"
+        "turn.steer" | "turn.interrupt" | "server_request.respond"
     ) {
         send_bridge_status_event(
             args,
@@ -1203,43 +1205,15 @@ async fn handle_active_turn_control_command(
 
 async fn execute_turn_control_command(command: &BridgeCommand) -> Result<Value> {
     let runner = semaphore_codex_runner_bin().context("semaphore-codex-runner is not installed")?;
-    let product_turn_id = command_payload_string(command, "productTurnId")
-        .context("control command is missing productTurnId")?;
-    let thread_id = command_payload_string(command, "threadId")
-        .context("control command is missing threadId")?;
-    let codex_turn_id = command_payload_string(command, "codexTurnId")
-        .context("control command is missing codexTurnId")?;
-    let websocket_url = command_payload_string(command, "appServerWs")
-        .unwrap_or_else(|| DEFAULT_CODEX_APP_SERVER_WS.to_string());
-    let codex_home = command_payload_string(command, "codexHome");
-    let client_message_id = command_payload_string(command, "clientMessageId");
+    let invocation = turn_control_runner_invocation(command)?;
     let rust_log = env::var("RUST_LOG").unwrap_or_else(|_| "warn".to_string());
     let mut process = Command::new(runner);
-    match command.command_type.as_str() {
-        "turn.steer" => {
-            let message = command_payload_string(command, "message")
-                .context("turn.steer command is missing message")?;
-            process.arg("steer").arg("--message").arg(message);
-        }
-        "turn.interrupt" => {
-            process.arg("interrupt");
-        }
-        other => return Err(anyhow!("unsupported control command `{other}`")),
-    }
+    process.args(invocation.args);
     process
-        .arg("--websocket-url")
-        .arg(websocket_url)
-        .arg("--thread-id")
-        .arg(thread_id)
-        .arg("--turn-id")
-        .arg(codex_turn_id)
-        .env("SEMAPHORE_PRODUCT_TURN_ID", product_turn_id)
+        .env("SEMAPHORE_PRODUCT_TURN_ID", invocation.product_turn_id)
         .env("NO_COLOR", "1")
         .env("RUST_LOG", rust_log);
-    if let Some(client_message_id) = client_message_id {
-        process.arg("--client-message-id").arg(client_message_id);
-    }
-    if let Some(codex_home) = codex_home {
+    if let Some(codex_home) = invocation.codex_home {
         process.env("CODEX_HOME", codex_home);
     }
     let output = tokio::time::timeout(Duration::from_secs(30), process.output())
@@ -1260,6 +1234,70 @@ async fn execute_turn_control_command(command: &BridgeCommand) -> Result<Value> 
         );
     }
     parse_control_result(&stdout)
+}
+
+struct TurnControlRunnerInvocation {
+    product_turn_id: String,
+    codex_home: Option<String>,
+    args: Vec<String>,
+}
+
+fn turn_control_runner_invocation(command: &BridgeCommand) -> Result<TurnControlRunnerInvocation> {
+    let product_turn_id = command_payload_string(command, "productTurnId")
+        .context("control command is missing productTurnId")?;
+    let thread_id = command_payload_string(command, "threadId")
+        .context("control command is missing threadId")?;
+    let codex_turn_id = command_payload_string(command, "codexTurnId")
+        .context("control command is missing codexTurnId")?;
+    let websocket_url = command_payload_string(command, "appServerWs")
+        .unwrap_or_else(|| DEFAULT_CODEX_APP_SERVER_WS.to_string());
+    let codex_home = command_payload_string(command, "codexHome");
+    let client_message_id = command_payload_string(command, "clientMessageId");
+    let mut args = Vec::new();
+    match command.command_type.as_str() {
+        "turn.steer" => {
+            let message = command_payload_string(command, "message")
+                .context("turn.steer command is missing message")?;
+            args.extend(["steer".to_string(), "--message".to_string(), message]);
+        }
+        "turn.interrupt" => {
+            args.push("interrupt".to_string());
+        }
+        "server_request.respond" => {
+            let request_id = command_payload_string(command, "serverRequestId")
+                .context("server_request.respond command is missing serverRequestId")?;
+            let response = command
+                .payload
+                .get("response")
+                .cloned()
+                .context("server_request.respond command is missing response")?;
+            args.extend([
+                "server-request".to_string(),
+                "respond".to_string(),
+                "--request-id".to_string(),
+                request_id,
+                "--response-json".to_string(),
+                serde_json::to_string(&response)?,
+            ]);
+        }
+        other => return Err(anyhow!("unsupported control command `{other}`")),
+    }
+    args.extend([
+        "--websocket-url".to_string(),
+        websocket_url,
+        "--thread-id".to_string(),
+        thread_id,
+        "--turn-id".to_string(),
+        codex_turn_id,
+    ]);
+    if let Some(client_message_id) = client_message_id {
+        args.extend(["--client-message-id".to_string(), client_message_id]);
+    }
+    Ok(TurnControlRunnerInvocation {
+        product_turn_id,
+        codex_home,
+        args,
+    })
 }
 
 fn semaphore_codex_runner_bin() -> Option<PathBuf> {
@@ -1593,6 +1631,72 @@ mod tests {
         assert!(
             !turn_start_runner_args("ws://x", "model", "message", Some(" "))
                 .contains(&"--thread-id".to_string())
+        );
+    }
+
+    #[test]
+    fn server_request_respond_runner_args_include_response_payload() {
+        let command = BridgeCommand {
+            id: Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap(),
+            command_type: "server_request.respond".to_string(),
+            payload: json!({
+                "productTurnId": "product-turn-1",
+                "threadId": "thread-1",
+                "codexTurnId": "turn-1",
+                "appServerWs": "ws://127.0.0.1:43113",
+                "codexHome": "/tmp/codex-home",
+                "clientMessageId": "client-message-1",
+                "serverRequestId": "7",
+                "response": {
+                    "answers": [{
+                        "questionId": "color",
+                        "answers": ["red"]
+                    }]
+                }
+            }),
+        };
+
+        let invocation = turn_control_runner_invocation(&command).unwrap();
+        let response_json_index = invocation
+            .args
+            .iter()
+            .position(|arg| arg == "--response-json")
+            .unwrap()
+            + 1;
+        let response_json: Value =
+            serde_json::from_str(&invocation.args[response_json_index]).unwrap();
+        let mut args = invocation.args.clone();
+        args[response_json_index] = "<response-json>".to_string();
+
+        assert_eq!(invocation.product_turn_id, "product-turn-1");
+        assert_eq!(invocation.codex_home.as_deref(), Some("/tmp/codex-home"));
+        assert_eq!(
+            response_json,
+            json!({
+                "answers": [{
+                    "questionId": "color",
+                    "answers": ["red"]
+                }]
+            })
+        );
+        assert_eq!(
+            args,
+            vec![
+                "server-request",
+                "respond",
+                "--request-id",
+                "7",
+                "--response-json",
+                "<response-json>",
+                "--websocket-url",
+                "ws://127.0.0.1:43113",
+                "--thread-id",
+                "thread-1",
+                "--turn-id",
+                "turn-1",
+                "--client-message-id",
+                "client-message-1",
+            ]
         );
     }
 

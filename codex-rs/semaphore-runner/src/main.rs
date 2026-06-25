@@ -44,6 +44,7 @@ enum Command {
     Turn(TurnCommand),
     Steer(TurnSteerCommand),
     Interrupt(TurnInterruptCommand),
+    ServerRequest(ServerRequestCommand),
 }
 
 #[derive(Debug, Parser)]
@@ -94,6 +95,33 @@ struct TurnInterruptCommand {
     thread_id: String,
     #[arg(long)]
     turn_id: String,
+    #[arg(long, env = "SEMAPHORE_PRODUCT_TURN_ID")]
+    product_turn_id: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+struct ServerRequestCommand {
+    #[command(subcommand)]
+    command: ServerRequestSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ServerRequestSubcommand {
+    Respond(ServerRequestRespondCommand),
+}
+
+#[derive(Debug, Parser)]
+struct ServerRequestRespondCommand {
+    #[arg(long, env = "SEMAPHORE_CODEX_APP_SERVER_WS", default_value = DEFAULT_WEBSOCKET_URL)]
+    websocket_url: String,
+    #[arg(long)]
+    thread_id: String,
+    #[arg(long)]
+    turn_id: String,
+    #[arg(long)]
+    request_id: String,
+    #[arg(long)]
+    response_json: String,
     #[arg(long, env = "SEMAPHORE_PRODUCT_TURN_ID")]
     product_turn_id: Option<String>,
 }
@@ -177,6 +205,7 @@ async fn main() -> Result<()> {
         Command::Turn(command) => run_turn(command).await,
         Command::Steer(command) => run_steer(command).await,
         Command::Interrupt(command) => run_interrupt(command).await,
+        Command::ServerRequest(command) => run_server_request(command).await,
     }
 }
 
@@ -437,6 +466,43 @@ async fn run_interrupt(command: TurnInterruptCommand) -> Result<()> {
         product_turn_id: command.product_turn_id,
         accepted: true,
     })
+}
+
+async fn run_server_request(command: ServerRequestCommand) -> Result<()> {
+    match command.command {
+        ServerRequestSubcommand::Respond(command) => run_server_request_respond(command).await,
+    }
+}
+
+async fn run_server_request_respond(command: ServerRequestRespondCommand) -> Result<()> {
+    let response: Value = serde_json::from_str(&command.response_json)
+        .context("server request response JSON is invalid")?;
+    let request_id = parse_request_id(&command.request_id);
+    let client = connect_app_server(&command.websocket_url).await?;
+    client
+        .resolve_server_request(request_id, response)
+        .await
+        .context("server request response failed")?;
+    client
+        .shutdown()
+        .await
+        .context("failed to shutdown Codex app-server client")?;
+    print_control_result(ControlResult {
+        schema_version: 1,
+        source: "codex_app_server_remote_client",
+        command: "server_request.respond",
+        thread_id: command.thread_id,
+        turn_id: command.turn_id,
+        product_turn_id: command.product_turn_id,
+        accepted: true,
+    })
+}
+
+fn parse_request_id(value: &str) -> RequestId {
+    value
+        .parse::<i64>()
+        .map(RequestId::Integer)
+        .unwrap_or_else(|_| RequestId::String(value.to_string()))
 }
 
 async fn connect_app_server(websocket_url: &str) -> Result<RemoteAppServerClient> {
@@ -2008,16 +2074,7 @@ async fn auto_resolve_server_request(
             .await?;
             Ok(false)
         }
-        ServerRequest::ToolRequestUserInput { request_id, .. } => {
-            resolve_server_request(
-                client,
-                request_id,
-                &method,
-                empty_tool_request_user_input_response(),
-            )
-            .await?;
-            Ok(false)
-        }
+        ServerRequest::ToolRequestUserInput { .. } => Ok(false),
         ServerRequest::DynamicToolCall { request_id, .. }
         | ServerRequest::ChatgptAuthTokensRefresh { request_id, .. }
         | ServerRequest::AttestationGenerate { request_id, .. }
@@ -2948,6 +3005,15 @@ mod tests {
         assert_eq!(
             serde_json::to_value(empty_tool_request_user_input_response()).unwrap(),
             json!({ "answers": {} })
+        );
+    }
+
+    #[test]
+    fn parse_request_id_keeps_numeric_and_string_ids() {
+        assert_eq!(parse_request_id("42"), RequestId::Integer(42));
+        assert_eq!(
+            parse_request_id("srv-42"),
+            RequestId::String("srv-42".to_string())
         );
     }
 
