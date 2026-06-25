@@ -16,8 +16,9 @@ use codex_app_server_protocol::{
     PermissionGrantScope, PermissionsRequestApprovalResponse, RequestId, SandboxMode,
     SandboxPolicy, ServerNotification, ServerRequest, ThreadItem, ThreadResumeParams,
     ThreadResumeResponse, ThreadSource, ThreadStartParams, ThreadStartResponse,
-    ToolRequestUserInputParams, TurnInterruptParams, TurnInterruptResponse, TurnStartParams,
-    TurnStartResponse, TurnStatus, TurnSteerParams, TurnSteerResponse, UserInput,
+    ToolRequestUserInputParams, ToolRequestUserInputResponse, TurnInterruptParams,
+    TurnInterruptResponse, TurnStartParams, TurnStartResponse, TurnStatus, TurnSteerParams,
+    TurnSteerResponse, UserInput,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -2007,8 +2008,17 @@ async fn auto_resolve_server_request(
             .await?;
             Ok(false)
         }
-        ServerRequest::ToolRequestUserInput { request_id, .. }
-        | ServerRequest::DynamicToolCall { request_id, .. }
+        ServerRequest::ToolRequestUserInput { request_id, .. } => {
+            resolve_server_request(
+                client,
+                request_id,
+                &method,
+                empty_tool_request_user_input_response(),
+            )
+            .await?;
+            Ok(false)
+        }
+        ServerRequest::DynamicToolCall { request_id, .. }
         | ServerRequest::ChatgptAuthTokensRefresh { request_id, .. }
         | ServerRequest::AttestationGenerate { request_id, .. }
         | ServerRequest::CurrentTimeRead { request_id, .. } => {
@@ -2025,6 +2035,12 @@ async fn auto_resolve_server_request(
                 .with_context(|| format!("failed to reject `{method}` server request"))?;
             Ok(false)
         }
+    }
+}
+
+fn empty_tool_request_user_input_response() -> ToolRequestUserInputResponse {
+    ToolRequestUserInputResponse {
+        answers: HashMap::new(),
     }
 }
 
@@ -2925,6 +2941,14 @@ mod tests {
         );
         assert!(payload["payloadSummary"].get("answers").is_none());
         assert!(payload["payloadSummary"].get("params").is_none());
+    }
+
+    #[test]
+    fn request_user_input_empty_response_uses_codex_response_shape() {
+        assert_eq!(
+            serde_json::to_value(empty_tool_request_user_input_response()).unwrap(),
+            json!({ "answers": {} })
+        );
     }
 
     #[test]
