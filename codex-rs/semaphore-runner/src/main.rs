@@ -1072,6 +1072,21 @@ fn notification_payload_summary(value: &Value) -> Value {
         "thread/goal/cleared" => {
             summary.insert("goalCleared".to_string(), json!(true));
         }
+        "thread/archived" | "thread/deleted" | "thread/unarchived" | "thread/closed" => {
+            let lifecycle = method
+                .strip_prefix("thread/")
+                .unwrap_or(method)
+                .replace('/', "_");
+            summary.insert("threadLifecycle".to_string(), json!(lifecycle));
+        }
+        "skills/changed" => {
+            summary.insert("skillsInvalidated".to_string(), json!(true));
+        }
+        "thread/settings/updated" => {
+            if let Some(settings) = params.get("threadSettings") {
+                insert_thread_settings_summary(&mut summary, settings);
+            }
+        }
         "item/autoApprovalReview/started" => {
             insert_auto_review_summary(&mut summary, params, false);
         }
@@ -1162,6 +1177,59 @@ fn notification_payload_summary(value: &Value) -> Value {
                 1_024,
             );
         }
+        "mcpServer/oauthLogin/completed" => {
+            copy_string_field(&mut summary, params, "name", "serverName", 160);
+            copy_bool_field(&mut summary, params, "success", "success");
+            insert_bounded_optional_string(
+                &mut summary,
+                params,
+                "error",
+                "errorPreview",
+                "errorPreviewTruncated",
+                1_024,
+            );
+        }
+        "account/updated" => {
+            copy_string_field(&mut summary, params, "authMode", "authMode", 80);
+            copy_string_field(&mut summary, params, "planType", "planType", 80);
+        }
+        "account/rateLimits/updated" => {
+            if let Some(rate_limits) = params.get("rateLimits") {
+                insert_rate_limits_summary(&mut summary, rate_limits);
+            }
+        }
+        "app/list/updated" => {
+            insert_app_list_summary(&mut summary, params);
+        }
+        "remoteControl/status/changed" => {
+            copy_string_field(&mut summary, params, "status", "remoteControlStatus", 80);
+            copy_string_field(&mut summary, params, "serverName", "serverName", 160);
+            summary.insert(
+                "installationPresent".to_string(),
+                json!(
+                    params
+                        .get("installationId")
+                        .and_then(Value::as_str)
+                        .is_some()
+                ),
+            );
+            summary.insert(
+                "environmentPresent".to_string(),
+                json!(
+                    params
+                        .get("environmentId")
+                        .and_then(Value::as_str)
+                        .is_some()
+                ),
+            );
+        }
+        "externalAgentConfig/import/progress" | "externalAgentConfig/import/completed" => {
+            insert_external_agent_config_import_summary(&mut summary, params);
+            summary.insert(
+                "importCompleted".to_string(),
+                json!(method == "externalAgentConfig/import/completed"),
+            );
+        }
         "fs/changed" => {
             insert_changed_paths_summary(&mut summary, params);
         }
@@ -1180,6 +1248,18 @@ fn notification_payload_summary(value: &Value) -> Value {
                 20,
                 160,
             );
+        }
+        "turn/moderationMetadata" => {
+            summary.insert(
+                "moderationMetadataPresent".to_string(),
+                json!(params.get("metadata").is_some()),
+            );
+            if let Some(metadata) = params.get("metadata") {
+                summary.insert(
+                    "moderationMetadataFieldCount".to_string(),
+                    json!(metadata.as_object().map_or(0, |object| object.len())),
+                );
+            }
         }
         "model/safetyBuffering/updated" => {
             copy_string_field(&mut summary, params, "model", "model", 160);
@@ -1209,6 +1289,24 @@ fn notification_payload_summary(value: &Value) -> Value {
                 "message",
                 "message",
                 "messageTruncated",
+                1_024,
+            );
+        }
+        "deprecationNotice" => {
+            insert_bounded_text_summary(
+                &mut summary,
+                params,
+                "summary",
+                "summary",
+                "summaryTruncated",
+                1_024,
+            );
+            insert_bounded_optional_string(
+                &mut summary,
+                params,
+                "details",
+                "detailsPreview",
+                "detailsPreviewTruncated",
                 1_024,
             );
         }
@@ -1294,6 +1392,104 @@ fn notification_payload_summary(value: &Value) -> Value {
                 }
                 summary.insert("item".to_string(), item_summary);
             }
+        }
+        "thread/compacted" => {
+            summary.insert("contextCompacted".to_string(), json!(true));
+        }
+        "fuzzyFileSearch/sessionUpdated" => {
+            insert_fuzzy_file_search_summary(&mut summary, params, true);
+        }
+        "fuzzyFileSearch/sessionCompleted" => {
+            insert_fuzzy_file_search_summary(&mut summary, params, false);
+            summary.insert("searchCompleted".to_string(), json!(true));
+        }
+        "thread/realtime/started" => {
+            copy_string_field(&mut summary, params, "version", "realtimeVersion", 80);
+            summary.insert(
+                "realtimeSessionPresent".to_string(),
+                json!(
+                    params
+                        .get("realtimeSessionId")
+                        .and_then(Value::as_str)
+                        .is_some()
+                ),
+            );
+        }
+        "thread/realtime/itemAdded" => {
+            summary.insert("realtimeItemPresent".to_string(), json!(true));
+            if let Some(item) = params.get("item") {
+                copy_string_field(&mut summary, item, "type", "realtimeItemType", 120);
+            }
+        }
+        "thread/realtime/transcript/delta" => {
+            copy_string_field(&mut summary, params, "role", "role", 80);
+            insert_text_presence_metadata(&mut summary, params, "delta", "transcriptDelta");
+        }
+        "thread/realtime/transcript/done" => {
+            copy_string_field(&mut summary, params, "role", "role", 80);
+            insert_text_presence_metadata(&mut summary, params, "text", "transcriptText");
+        }
+        "thread/realtime/outputAudio/delta" => {
+            if let Some(audio) = params.get("audio") {
+                insert_realtime_audio_summary(&mut summary, audio);
+            }
+        }
+        "thread/realtime/sdp" => {
+            insert_text_presence_metadata(&mut summary, params, "sdp", "sdp");
+        }
+        "thread/realtime/error" => {
+            insert_bounded_text_summary(
+                &mut summary,
+                params,
+                "message",
+                "message",
+                "messageTruncated",
+                1_024,
+            );
+        }
+        "thread/realtime/closed" => {
+            insert_bounded_optional_string(
+                &mut summary,
+                params,
+                "reason",
+                "reason",
+                "reasonTruncated",
+                512,
+            );
+        }
+        "windows/worldWritableWarning" => {
+            if let Some(sample_paths) = params.get("samplePaths").and_then(Value::as_array) {
+                summary.insert("samplePathCount".to_string(), json!(sample_paths.len()));
+            }
+            insert_i64_field(&mut summary, params, "extraCount", "extraCount");
+            copy_bool_field(&mut summary, params, "failedScan", "failedScan");
+        }
+        "windowsSandbox/setupCompleted" => {
+            copy_string_field(&mut summary, params, "mode", "mode", 80);
+            copy_bool_field(&mut summary, params, "success", "success");
+            insert_bounded_optional_string(
+                &mut summary,
+                params,
+                "error",
+                "errorPreview",
+                "errorPreviewTruncated",
+                1_024,
+            );
+        }
+        "account/login/completed" => {
+            summary.insert(
+                "loginIdPresent".to_string(),
+                json!(params.get("loginId").and_then(Value::as_str).is_some()),
+            );
+            copy_bool_field(&mut summary, params, "success", "success");
+            insert_bounded_optional_string(
+                &mut summary,
+                params,
+                "error",
+                "errorPreview",
+                "errorPreviewTruncated",
+                1_024,
+            );
         }
         _ => {}
     }
@@ -1413,6 +1609,244 @@ fn insert_thread_goal_summary(summary: &mut serde_json::Map<String, Value>, goal
     insert_i64_field(summary, goal, "tokenBudget", "tokenBudget");
     insert_i64_field(summary, goal, "tokensUsed", "tokensUsed");
     insert_i64_field(summary, goal, "timeUsedSeconds", "timeUsedSeconds");
+}
+
+fn insert_thread_settings_summary(summary: &mut serde_json::Map<String, Value>, settings: &Value) {
+    for key in [
+        "cwd",
+        "model",
+        "modelProvider",
+        "serviceTier",
+        "effort",
+        "summary",
+        "collaborationMode",
+        "personality",
+        "approvalPolicy",
+        "approvalsReviewer",
+    ] {
+        copy_string_field(summary, settings, key, key, 512);
+    }
+    summary.insert(
+        "sandboxPolicyPresent".to_string(),
+        json!(settings.get("sandboxPolicy").is_some()),
+    );
+    summary.insert(
+        "activePermissionProfilePresent".to_string(),
+        json!(settings.get("activePermissionProfile").is_some()),
+    );
+}
+
+fn insert_rate_limits_summary(summary: &mut serde_json::Map<String, Value>, rate_limits: &Value) {
+    copy_string_field(summary, rate_limits, "planType", "planType", 80);
+    copy_string_field(
+        summary,
+        rate_limits,
+        "rateLimitReachedType",
+        "rateLimitReachedType",
+        80,
+    );
+    for (source_key, prefix) in [("primary", "primary"), ("secondary", "secondary")] {
+        if let Some(window) = rate_limits.get(source_key) {
+            insert_rate_limit_window_summary(summary, window, prefix);
+        }
+    }
+    if let Some(credits) = rate_limits.get("credits") {
+        copy_bool_field(summary, credits, "hasCredits", "hasCredits");
+        copy_bool_field(summary, credits, "unlimited", "unlimited");
+    }
+    if let Some(individual_limit) = rate_limits.get("individualLimit") {
+        insert_number_field(
+            summary,
+            individual_limit,
+            "remainingPercent",
+            "individualLimitRemainingPercent",
+        );
+        insert_i64_field(
+            summary,
+            individual_limit,
+            "resetsAt",
+            "individualLimitResetsAt",
+        );
+    }
+}
+
+fn insert_rate_limit_window_summary(
+    summary: &mut serde_json::Map<String, Value>,
+    window: &Value,
+    prefix: &str,
+) {
+    insert_number_field(
+        summary,
+        window,
+        "usedPercent",
+        &format!("{prefix}UsedPercent"),
+    );
+    insert_i64_field(
+        summary,
+        window,
+        "windowDurationMins",
+        &format!("{prefix}WindowDurationMins"),
+    );
+    insert_i64_field(summary, window, "resetsAt", &format!("{prefix}ResetsAt"));
+}
+
+fn insert_app_list_summary(summary: &mut serde_json::Map<String, Value>, params: &Value) {
+    let Some(apps) = params.get("data").and_then(Value::as_array) else {
+        return;
+    };
+    summary.insert("appCount".to_string(), json!(apps.len()));
+    summary.insert(
+        "enabledAppCount".to_string(),
+        json!(
+            apps.iter()
+                .filter(|app| app.get("isEnabled").and_then(Value::as_bool) == Some(true))
+                .count()
+        ),
+    );
+    summary.insert(
+        "accessibleAppCount".to_string(),
+        json!(
+            apps.iter()
+                .filter(|app| app.get("isAccessible").and_then(Value::as_bool) == Some(true))
+                .count()
+        ),
+    );
+    let app_names = apps
+        .iter()
+        .filter_map(|app| app.get("name").and_then(Value::as_str))
+        .take(10)
+        .map(|name| {
+            let (value, truncated) = bounded_text(name, 160);
+            json!({
+                "value": value,
+                "truncated": truncated,
+            })
+        })
+        .collect::<Vec<_>>();
+    summary.insert("appNames".to_string(), json!(app_names));
+    summary.insert("appNamesTruncated".to_string(), json!(apps.len() > 10));
+}
+
+fn insert_external_agent_config_import_summary(
+    summary: &mut serde_json::Map<String, Value>,
+    params: &Value,
+) {
+    copy_string_field(summary, params, "importId", "importId", 160);
+    let Some(results) = params.get("itemTypeResults").and_then(Value::as_array) else {
+        return;
+    };
+    summary.insert("itemTypeResultCount".to_string(), json!(results.len()));
+    let mut success_count = 0usize;
+    let mut failure_count = 0usize;
+    let result_summaries = results
+        .iter()
+        .take(10)
+        .map(|result| {
+            let successes = result
+                .get("successes")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let failures = result
+                .get("failures")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            success_count = success_count.saturating_add(successes);
+            failure_count = failure_count.saturating_add(failures);
+            json!({
+                "itemType": result.get("itemType").and_then(Value::as_str),
+                "successCount": successes,
+                "failureCount": failures,
+            })
+        })
+        .collect::<Vec<_>>();
+    for result in results.iter().skip(10) {
+        success_count = success_count.saturating_add(
+            result
+                .get("successes")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len),
+        );
+        failure_count = failure_count.saturating_add(
+            result
+                .get("failures")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len),
+        );
+    }
+    summary.insert("successCount".to_string(), json!(success_count));
+    summary.insert("failureCount".to_string(), json!(failure_count));
+    summary.insert("itemTypeResults".to_string(), json!(result_summaries));
+    summary.insert(
+        "itemTypeResultsTruncated".to_string(),
+        json!(results.len() > 10),
+    );
+}
+
+fn insert_fuzzy_file_search_summary(
+    summary: &mut serde_json::Map<String, Value>,
+    params: &Value,
+    include_files: bool,
+) {
+    copy_string_field(summary, params, "sessionId", "searchSessionId", 160);
+    insert_bounded_optional_string(
+        summary,
+        params,
+        "query",
+        "queryPreview",
+        "queryPreviewTruncated",
+        512,
+    );
+    if !include_files {
+        return;
+    }
+    let Some(files) = params.get("files").and_then(Value::as_array) else {
+        return;
+    };
+    summary.insert("fileMatchCount".to_string(), json!(files.len()));
+    let file_matches = files
+        .iter()
+        .take(10)
+        .map(|file| {
+            let mut value = serde_json::Map::new();
+            copy_string_field(&mut value, file, "path", "path", 512);
+            copy_string_field(&mut value, file, "file_name", "fileName", 160);
+            copy_string_field(&mut value, file, "match_type", "matchType", 80);
+            insert_i64_field(&mut value, file, "score", "score");
+            Value::Object(value)
+        })
+        .collect::<Vec<_>>();
+    summary.insert("fileMatches".to_string(), json!(file_matches));
+    summary.insert("fileMatchesTruncated".to_string(), json!(files.len() > 10));
+}
+
+fn insert_text_presence_metadata(
+    summary: &mut serde_json::Map<String, Value>,
+    params: &Value,
+    source_key: &str,
+    output_key_prefix: &str,
+) {
+    let Some(value) = params.get(source_key).and_then(Value::as_str) else {
+        return;
+    };
+    summary.insert(
+        format!("{output_key_prefix}Present"),
+        json!(!value.is_empty()),
+    );
+    summary.insert(format!("{output_key_prefix}ByteCount"), json!(value.len()));
+}
+
+fn insert_realtime_audio_summary(summary: &mut serde_json::Map<String, Value>, audio: &Value) {
+    summary.insert(
+        "audioDataPresent".to_string(),
+        json!(audio.get("data").and_then(Value::as_str).is_some()),
+    );
+    if let Some(data) = audio.get("data").and_then(Value::as_str) {
+        summary.insert("audioEncodedByteCount".to_string(), json!(data.len()));
+    }
+    insert_i64_field(summary, audio, "sampleRate", "sampleRate");
+    insert_i64_field(summary, audio, "numChannels", "numChannels");
+    insert_i64_field(summary, audio, "samplesPerChannel", "samplesPerChannel");
+    copy_string_field(summary, audio, "itemId", "audioItemId", 160);
 }
 
 fn insert_auto_review_summary(
@@ -2053,6 +2487,28 @@ fn copy_string_field(
     summary.insert(output_key.to_string(), json!(text));
     if truncated {
         summary.insert(format!("{output_key}Truncated"), json!(true));
+    }
+}
+
+fn copy_bool_field(
+    summary: &mut serde_json::Map<String, Value>,
+    value: &Value,
+    source_key: &str,
+    output_key: &str,
+) {
+    if let Some(boolean) = value.get(source_key).and_then(Value::as_bool) {
+        summary.insert(output_key.to_string(), json!(boolean));
+    }
+}
+
+fn insert_number_field(
+    summary: &mut serde_json::Map<String, Value>,
+    value: &Value,
+    source_key: &str,
+    output_key: &str,
+) {
+    if let Some(number) = value.get(source_key).and_then(Value::as_f64) {
+        summary.insert(output_key.to_string(), json!(number));
     }
 }
 
@@ -3111,6 +3567,151 @@ mod tests {
                 .to_string()
                 .contains("SECRET_RAW_OUTPUT")
         );
+    }
+
+    #[test]
+    fn system_notification_summaries_keep_safe_metadata_only() {
+        let settings_summary = notification_payload_summary(&json!({
+            "method": "thread/settings/updated",
+            "params": {
+                "threadId": "thread-1",
+                "threadSettings": {
+                    "cwd": "/workspace/repo",
+                    "model": "gpt-5-codex",
+                    "modelProvider": "openai",
+                    "approvalPolicy": "never",
+                    "approvalsReviewer": "auto_review",
+                    "sandboxPolicy": {"mode": "dangerFullAccess"},
+                    "activePermissionProfile": {"name": "operator-internal"}
+                }
+            }
+        }));
+        assert_eq!(settings_summary["model"], "gpt-5-codex");
+        assert_eq!(settings_summary["approvalPolicy"], "never");
+        assert_eq!(settings_summary["sandboxPolicyPresent"], true);
+        assert_eq!(settings_summary["activePermissionProfilePresent"], true);
+        assert!(settings_summary.get("sandboxPolicy").is_none());
+        assert!(settings_summary.get("activePermissionProfile").is_none());
+
+        let login_summary = notification_payload_summary(&json!({
+            "method": "account/login/completed",
+            "params": {
+                "loginId": "login-secret-id",
+                "success": false,
+                "error": "provider token expired"
+            }
+        }));
+        assert_eq!(login_summary["loginIdPresent"], true);
+        assert_eq!(login_summary["success"], false);
+        assert_eq!(login_summary["errorPreview"], "provider token expired");
+        assert!(login_summary.get("loginId").is_none());
+        assert!(!login_summary.to_string().contains("login-secret-id"));
+
+        let rate_summary = notification_payload_summary(&json!({
+            "method": "account/rateLimits/updated",
+            "params": {
+                "rateLimits": {
+                    "limitId": "limit-secret",
+                    "limitName": "internal account cap",
+                    "planType": "pro",
+                    "rateLimitReachedType": "primary",
+                    "primary": {
+                        "usedPercent": 63.5,
+                        "windowDurationMins": 300,
+                        "resetsAt": 123456
+                    },
+                    "credits": {
+                        "hasCredits": true,
+                        "unlimited": false,
+                        "balance": "secret-balance"
+                    },
+                    "individualLimit": {
+                        "limit": "secret-limit",
+                        "used": "secret-used",
+                        "remainingPercent": 42.0,
+                        "resetsAt": 654321
+                    }
+                }
+            }
+        }));
+        assert_eq!(rate_summary["planType"], "pro");
+        assert_eq!(rate_summary["primaryUsedPercent"], 63.5);
+        assert_eq!(rate_summary["hasCredits"], true);
+        assert_eq!(rate_summary["individualLimitRemainingPercent"], 42.0);
+        assert!(rate_summary.get("limitId").is_none());
+        assert!(rate_summary.get("balance").is_none());
+        assert!(!rate_summary.to_string().contains("secret-balance"));
+
+        let realtime_summary = notification_payload_summary(&json!({
+            "method": "thread/realtime/transcript/done",
+            "params": {
+                "threadId": "thread-1",
+                "role": "assistant",
+                "text": "private transcript text"
+            }
+        }));
+        assert_eq!(realtime_summary["role"], "assistant");
+        assert_eq!(realtime_summary["transcriptTextPresent"], true);
+        assert_eq!(realtime_summary["transcriptTextByteCount"], 23);
+        assert!(realtime_summary.get("text").is_none());
+        assert!(
+            !realtime_summary
+                .to_string()
+                .contains("private transcript text")
+        );
+
+        let audio_summary = notification_payload_summary(&json!({
+            "method": "thread/realtime/outputAudio/delta",
+            "params": {
+                "threadId": "thread-1",
+                "audio": {
+                    "data": "BASE64AUDIO",
+                    "sampleRate": 24000,
+                    "numChannels": 1,
+                    "samplesPerChannel": 480,
+                    "itemId": "audio-item-1"
+                }
+            }
+        }));
+        assert_eq!(audio_summary["audioDataPresent"], true);
+        assert_eq!(audio_summary["audioEncodedByteCount"], 11);
+        assert_eq!(audio_summary["sampleRate"], 24000);
+        assert!(audio_summary.get("data").is_none());
+        assert!(!audio_summary.to_string().contains("BASE64AUDIO"));
+
+        let sdp_summary = notification_payload_summary(&json!({
+            "method": "thread/realtime/sdp",
+            "params": {
+                "threadId": "thread-1",
+                "sdp": "v=0 private sdp"
+            }
+        }));
+        assert_eq!(sdp_summary["sdpPresent"], true);
+        assert_eq!(sdp_summary["sdpByteCount"], 15);
+        assert!(sdp_summary.get("sdp").is_none());
+        assert!(!sdp_summary.to_string().contains("private sdp"));
+
+        let search_summary = notification_payload_summary(&json!({
+            "method": "fuzzyFileSearch/sessionUpdated",
+            "params": {
+                "sessionId": "search-1",
+                "query": "workspace query",
+                "files": [{
+                    "root": "/secret/root",
+                    "path": "src/main.rs",
+                    "match_type": "file",
+                    "file_name": "main.rs",
+                    "score": 90,
+                    "indices": [0, 1]
+                }]
+            }
+        }));
+        assert_eq!(search_summary["searchSessionId"], "search-1");
+        assert_eq!(search_summary["queryPreview"], "workspace query");
+        assert_eq!(search_summary["fileMatchCount"], 1);
+        assert_eq!(search_summary["fileMatches"][0]["path"], "src/main.rs");
+        assert!(search_summary["fileMatches"][0].get("root").is_none());
+        assert!(!search_summary.to_string().contains("/secret/root"));
     }
 
     #[test]
