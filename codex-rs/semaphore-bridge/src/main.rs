@@ -950,6 +950,11 @@ async fn execute_turn_start_command(
     let codex_home = command_payload_string(command, "codexHome");
     let client_message_id = command_payload_string(command, "clientMessageId");
     let thread_id = command_payload_string(command, "threadId");
+    let composer_context_json = command
+        .payload
+        .get("composerContext")
+        .filter(|value| !value.is_null())
+        .map(Value::to_string);
     let api_base_url = args.api_base_url.trim_end_matches('/').to_string();
     let organization_id = args.organization_id.to_string();
     let session_id = args.session_id.to_string();
@@ -964,6 +969,7 @@ async fn execute_turn_start_command(
             &model,
             &message,
             thread_id.as_deref(),
+            composer_context_json.as_deref(),
         ))
         .env("SEMAPHORE_API_BASE_URL", api_base_url)
         .env("SEMAPHORE_ORGANIZATION_ID", organization_id)
@@ -1015,6 +1021,7 @@ fn turn_start_runner_args(
     model: &str,
     message: &str,
     thread_id: Option<&str>,
+    composer_context_json: Option<&str>,
 ) -> Vec<String> {
     let mut args = vec![
         "turn".to_string(),
@@ -1028,6 +1035,13 @@ fn turn_start_runner_args(
     if let Some(thread_id) = thread_id.map(str::trim).filter(|value| !value.is_empty()) {
         args.push("--thread-id".to_string());
         args.push(thread_id.to_string());
+    }
+    if let Some(context) = composer_context_json
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        args.push("--composer-context-json".to_string());
+        args.push(context.to_string());
     }
     args
 }
@@ -1270,12 +1284,24 @@ fn turn_control_runner_invocation(command: &BridgeCommand) -> Result<TurnControl
         .unwrap_or_else(|| DEFAULT_CODEX_APP_SERVER_WS.to_string());
     let codex_home = command_payload_string(command, "codexHome");
     let client_message_id = command_payload_string(command, "clientMessageId");
+    let composer_context_json = command
+        .payload
+        .get("composerContext")
+        .filter(|value| !value.is_null())
+        .map(Value::to_string);
     let mut args = Vec::new();
     match command.command_type.as_str() {
         "turn.steer" => {
             let message = command_payload_string(command, "message")
                 .context("turn.steer command is missing message")?;
             args.extend(["steer".to_string(), "--message".to_string(), message]);
+            if let Some(context) = composer_context_json
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                args.extend(["--composer-context-json".to_string(), context.to_string()]);
+            }
         }
         "turn.interrupt" => {
             args.push("interrupt".to_string());
@@ -1633,6 +1659,7 @@ mod tests {
             "gpt-validation",
             "continue",
             Some("  thread-1  "),
+            None,
         );
 
         assert_eq!(
@@ -1650,12 +1677,80 @@ mod tests {
             ]
         );
         assert!(
-            !turn_start_runner_args("ws://x", "model", "message", None)
+            !turn_start_runner_args("ws://x", "model", "message", None, None)
                 .contains(&"--thread-id".to_string())
         );
         assert!(
-            !turn_start_runner_args("ws://x", "model", "message", Some(" "))
+            !turn_start_runner_args("ws://x", "model", "message", Some(" "), None)
                 .contains(&"--thread-id".to_string())
+        );
+    }
+
+    #[test]
+    fn turn_start_runner_args_include_composer_context_when_present() {
+        let context = r#"{"targetBranch":"feature/session-context"}"#;
+        let args = turn_start_runner_args(
+            "ws://127.0.0.1:43113",
+            "gpt-validation",
+            "continue",
+            None,
+            Some(context),
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "turn",
+                "--websocket-url",
+                "ws://127.0.0.1:43113",
+                "--model",
+                "gpt-validation",
+                "--message",
+                "continue",
+                "--composer-context-json",
+                context,
+            ]
+        );
+    }
+
+    #[test]
+    fn turn_steer_runner_args_include_composer_context_when_present() {
+        let command = BridgeCommand {
+            id: Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap(),
+            command_type: "turn.steer".to_string(),
+            payload: json!({
+                "productTurnId": "product-turn-1",
+                "threadId": "thread-1",
+                "codexTurnId": "turn-1",
+                "appServerWs": "ws://127.0.0.1:43113",
+                "clientMessageId": "client-message-1",
+                "message": "continue",
+                "composerContext": {
+                    "targetBranch": "feature/session-context"
+                }
+            }),
+        };
+
+        let invocation = turn_control_runner_invocation(&command).unwrap();
+
+        assert_eq!(invocation.product_turn_id, "product-turn-1");
+        assert_eq!(
+            invocation.args,
+            vec![
+                "steer",
+                "--message",
+                "continue",
+                "--composer-context-json",
+                r#"{"targetBranch":"feature/session-context"}"#,
+                "--websocket-url",
+                "ws://127.0.0.1:43113",
+                "--thread-id",
+                "thread-1",
+                "--turn-id",
+                "turn-1",
+                "--client-message-id",
+                "client-message-1",
+            ]
         );
     }
 

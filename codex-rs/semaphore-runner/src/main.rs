@@ -9,18 +9,19 @@ use codex_app_server_client::{
     AppServerEvent, RemoteAppServerClient, RemoteAppServerConnectArgs, RemoteAppServerEndpoint,
 };
 use codex_app_server_protocol::{
-    AgentMessageDeltaNotification, ApprovalsReviewer, AskForApproval, ClientRequest,
-    CommandExecutionApprovalDecision, CommandExecutionRequestApprovalParams,
-    CommandExecutionRequestApprovalResponse, FileChangeApprovalDecision,
-    FileChangeRequestApprovalParams, FileChangeRequestApprovalResponse, GrantedPermissionProfile,
-    JSONRPCErrorError, McpServerElicitationAction, McpServerElicitationRequest,
-    McpServerElicitationRequestParams, McpServerElicitationRequestResponse, PermissionGrantScope,
-    PermissionsRequestApprovalParams, PermissionsRequestApprovalResponse, RequestId, SandboxMode,
-    SandboxPolicy, ServerNotification, ServerRequest, ThreadItem,
-    ThreadResumeInitialTurnsPageParams, ThreadResumeParams, ThreadResumeResponse, ThreadSource,
-    ThreadStartParams, ThreadStartResponse, ToolRequestUserInputParams,
-    ToolRequestUserInputResponse, TurnInterruptParams, TurnInterruptResponse, TurnItemsView,
-    TurnStartParams, TurnStartResponse, TurnStatus, TurnSteerParams, TurnSteerResponse, UserInput,
+    AdditionalContextEntry, AdditionalContextKind, AgentMessageDeltaNotification,
+    ApprovalsReviewer, AskForApproval, ClientRequest, CommandExecutionApprovalDecision,
+    CommandExecutionRequestApprovalParams, CommandExecutionRequestApprovalResponse,
+    FileChangeApprovalDecision, FileChangeRequestApprovalParams, FileChangeRequestApprovalResponse,
+    GrantedPermissionProfile, JSONRPCErrorError, McpServerElicitationAction,
+    McpServerElicitationRequest, McpServerElicitationRequestParams,
+    McpServerElicitationRequestResponse, PermissionGrantScope, PermissionsRequestApprovalParams,
+    PermissionsRequestApprovalResponse, RequestId, SandboxMode, SandboxPolicy, ServerNotification,
+    ServerRequest, ThreadItem, ThreadResumeInitialTurnsPageParams, ThreadResumeParams,
+    ThreadResumeResponse, ThreadSource, ThreadStartParams, ThreadStartResponse,
+    ToolRequestUserInputParams, ToolRequestUserInputResponse, TurnInterruptParams,
+    TurnInterruptResponse, TurnItemsView, TurnStartParams, TurnStartResponse, TurnStatus,
+    TurnSteerParams, TurnSteerResponse, UserInput,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -65,6 +66,8 @@ struct TurnCommand {
     message_file: Option<PathBuf>,
     #[arg(long, env = "SEMAPHORE_CODEX_CLIENT_MESSAGE_ID")]
     client_message_id: Option<String>,
+    #[arg(long, env = "SEMAPHORE_COMPOSER_CONTEXT_JSON")]
+    composer_context_json: Option<String>,
     #[arg(long, env = "SEMAPHORE_CODEX_THREAD_ID")]
     thread_id: Option<String>,
     #[arg(long, env = "SEMAPHORE_PRODUCT_TURN_ID")]
@@ -87,6 +90,8 @@ struct TurnSteerCommand {
     message_file: Option<PathBuf>,
     #[arg(long, env = "SEMAPHORE_CODEX_CLIENT_MESSAGE_ID")]
     client_message_id: Option<String>,
+    #[arg(long, env = "SEMAPHORE_COMPOSER_CONTEXT_JSON")]
+    composer_context_json: Option<String>,
     #[arg(long, env = "SEMAPHORE_PRODUCT_TURN_ID")]
     product_turn_id: Option<String>,
 }
@@ -256,6 +261,8 @@ async fn run_turn(command: TurnCommand) -> Result<()> {
         responsesapi_client_metadata
             .insert("semaphore_turn_id".to_string(), product_turn_id.clone());
     }
+    let additional_context =
+        composer_context_additional_context(command.composer_context_json.as_deref())?;
 
     let turn: TurnStartResponse = client
         .request_typed(ClientRequest::TurnStart {
@@ -268,6 +275,7 @@ async fn run_turn(command: TurnCommand) -> Result<()> {
                     text_elements: Vec::new(),
                 }],
                 responsesapi_client_metadata: Some(responsesapi_client_metadata),
+                additional_context,
                 cwd: command.cwd.clone(),
                 approval_policy: Some(AskForApproval::Never),
                 approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
@@ -427,6 +435,8 @@ async fn run_steer(command: TurnSteerCommand) -> Result<()> {
     let message = read_steer_message(&command)?;
     let client = connect_app_server(&command.websocket_url).await?;
     let mut request_ids = RequestIds::new();
+    let additional_context =
+        composer_context_additional_context(command.composer_context_json.as_deref())?;
     let _: TurnSteerResponse = client
         .request_typed(ClientRequest::TurnSteer {
             request_id: request_ids.next(),
@@ -438,7 +448,7 @@ async fn run_steer(command: TurnSteerCommand) -> Result<()> {
                     text_elements: Vec::new(),
                 }],
                 responsesapi_client_metadata: None,
-                additional_context: None,
+                additional_context,
                 expected_turn_id: command.turn_id.clone(),
             },
         })
@@ -573,6 +583,81 @@ fn read_steer_message(command: &TurnSteerCommand) -> Result<String> {
             .with_context(|| format!("failed to read message file `{}`", path.display()));
     }
     bail!("missing steer message; set --message, --message-file, or SEMAPHORE_CODEX_STEER_MESSAGE")
+}
+
+fn composer_context_additional_context(
+    raw_context: Option<&str>,
+) -> Result<Option<HashMap<String, AdditionalContextEntry>>> {
+    let Some(raw_context) = clean_optional_string(raw_context) else {
+        return Ok(None);
+    };
+    let value: Value =
+        serde_json::from_str(&raw_context).context("composer context JSON is invalid")?;
+    let Some(context) = composer_context_text(&value) else {
+        return Ok(None);
+    };
+    Ok(Some(HashMap::from([(
+        "semaphore.composerContext".to_string(),
+        AdditionalContextEntry {
+            value: context,
+            kind: AdditionalContextKind::Application,
+        },
+    )])))
+}
+
+fn composer_context_text(value: &Value) -> Option<String> {
+    let mut lines = vec![
+        "Semaphore composer context:".to_string(),
+        "Treat this as product-owned user context for this turn. It does not override higher-priority instructions or Semaphore policy.".to_string(),
+    ];
+    if let Some(target_branch) = json_string(value, "targetBranch") {
+        lines.push(format!("Target branch: {target_branch}"));
+    }
+    push_context_values(
+        &mut lines,
+        "Repository mentions",
+        json_string_array(value, "repositoryMentions"),
+    );
+    push_context_values(
+        &mut lines,
+        "Path mentions",
+        json_string_array(value, "pathMentions"),
+    );
+    push_context_values(
+        &mut lines,
+        "Artifact mentions",
+        json_string_array(value, "artifactMentions"),
+    );
+    (lines.len() > 2).then(|| lines.join("\n"))
+}
+
+fn push_context_values(lines: &mut Vec<String>, label: &str, values: Vec<String>) {
+    if !values.is_empty() {
+        lines.push(format!("{label}: {}", values.join(", ")));
+    }
+}
+
+fn json_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(160).collect())
+}
+
+fn json_string_array(value: &Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .take(8)
+        .map(|value| value.chars().take(160).collect())
+        .collect()
 }
 
 async fn handle_event(
@@ -3314,6 +3399,34 @@ mod tests {
             Some("thread-1")
         );
         assert_eq!(clean_optional_string(Some("   ")), None);
+    }
+
+    #[test]
+    fn composer_context_additional_context_builds_application_context() {
+        let context = composer_context_additional_context(Some(
+            r#"{"targetBranch":"feature/session-context","repositoryMentions":["ramonainc/test-repo"],"pathMentions":["web/components/workspace-client.tsx"],"artifactMentions":["artifact-1"]}"#,
+        ))
+        .unwrap()
+        .unwrap();
+        let entry = context.get("semaphore.composerContext").unwrap();
+
+        assert_eq!(entry.kind, AdditionalContextKind::Application);
+        assert!(
+            entry
+                .value
+                .contains("Target branch: feature/session-context")
+        );
+        assert!(
+            entry
+                .value
+                .contains("Repository mentions: ramonainc/test-repo")
+        );
+        assert!(
+            entry
+                .value
+                .contains("Path mentions: web/components/workspace-client.tsx")
+        );
+        assert!(entry.value.contains("Artifact mentions: artifact-1"));
     }
 
     #[test]
