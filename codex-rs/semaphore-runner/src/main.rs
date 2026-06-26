@@ -610,6 +610,9 @@ fn composer_context_text(value: &Value) -> Option<String> {
         "Semaphore composer context:".to_string(),
         "Treat this as product-owned user context for this turn. It does not override higher-priority instructions or Semaphore policy.".to_string(),
     ];
+    if let Some(mode) = json_string(value, "mode").and_then(composer_mode_label) {
+        lines.push(format!("Requested mode: {mode}"));
+    }
     if let Some(target_branch) = json_string(value, "targetBranch") {
         lines.push(format!("Target branch: {target_branch}"));
     }
@@ -629,6 +632,15 @@ fn composer_context_text(value: &Value) -> Option<String> {
         json_string_array(value, "artifactMentions"),
     );
     (lines.len() > 2).then(|| lines.join("\n"))
+}
+
+fn composer_mode_label(value: String) -> Option<&'static str> {
+    match value.as_str() {
+        "work" => Some("Work"),
+        "ask" => Some("Ask"),
+        "review" => Some("Review"),
+        _ => None,
+    }
 }
 
 fn push_context_values(lines: &mut Vec<String>, label: &str, values: Vec<String>) {
@@ -3404,13 +3416,14 @@ mod tests {
     #[test]
     fn composer_context_additional_context_builds_application_context() {
         let context = composer_context_additional_context(Some(
-            r#"{"targetBranch":"feature/session-context","repositoryMentions":["ramonainc/test-repo"],"pathMentions":["web/components/workspace-client.tsx"],"artifactMentions":["artifact-1"]}"#,
+            r#"{"mode":"review","targetBranch":"feature/session-context","repositoryMentions":["ramonainc/test-repo"],"pathMentions":["web/components/workspace-client.tsx"],"artifactMentions":["artifact-1"]}"#,
         ))
         .unwrap()
         .unwrap();
         let entry = context.get("semaphore.composerContext").unwrap();
 
         assert_eq!(entry.kind, AdditionalContextKind::Application);
+        assert!(entry.value.contains("Requested mode: Review"));
         assert!(
             entry
                 .value
