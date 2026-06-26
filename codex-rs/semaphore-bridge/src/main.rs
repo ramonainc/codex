@@ -173,6 +173,17 @@ impl EventSpool {
             .unwrap_or(0)
     }
 
+    fn retain_bridge_epoch(&mut self, bridge_epoch: &str) -> Result<usize> {
+        let original_len = self.events.len();
+        self.events
+            .retain(|event| event.bridge_epoch == bridge_epoch);
+        let dropped = original_len - self.events.len();
+        if dropped > 0 {
+            self.persist()?;
+        }
+        Ok(dropped)
+    }
+
     fn append(&mut self, event: BridgeEventBody) -> Result<()> {
         self.events.push(event);
         self.enforce_bound();
@@ -405,6 +416,12 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| default_spool_path(args.runtime_id)),
         args.spool_max_events,
     )?;
+    let dropped_spooled_events = spool.retain_bridge_epoch(&bridge_epoch)?;
+    if dropped_spooled_events > 0 {
+        eprintln!(
+            "Sandbox bridge dropped {dropped_spooled_events} stale spooled event(s) from older bridge epochs"
+        );
+    }
 
     let mut sequence = (spool.max_sequence() + 1).max(1);
     loop {
@@ -1437,10 +1454,18 @@ mod tests {
     }
 
     fn test_event(sequence: i64, event_type: &str) -> BridgeEventBody {
+        test_event_with_epoch(sequence, event_type, "runtime-epoch:pid-1:123")
+    }
+
+    fn test_event_with_epoch(
+        sequence: i64,
+        event_type: &str,
+        bridge_epoch: &str,
+    ) -> BridgeEventBody {
         bridge_event(
             organization_id(),
             runtime_id(),
-            "runtime-epoch:pid-1:123",
+            bridge_epoch,
             sequence,
             event_type,
             json!({ "source": "test" }),
@@ -1736,6 +1761,44 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(sequences, vec![2, 3]);
+        assert_eq!(reloaded.max_sequence(), 3);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn event_spool_discards_events_from_old_bridge_epochs() {
+        let path = temp_spool_path("bridge-epoch");
+        let current_epoch = "runtime-epoch:bridge-current";
+        let mut spool = EventSpool::load(path.clone(), 8).unwrap();
+
+        spool
+            .append(test_event_with_epoch(
+                10,
+                "heartbeat",
+                "runtime-epoch:bridge-old",
+            ))
+            .unwrap();
+        spool
+            .append(test_event_with_epoch(3, "turn.completed", current_epoch))
+            .unwrap();
+        spool
+            .append(test_event_with_epoch(
+                11,
+                "turn.failed",
+                "runtime-epoch:bridge-older",
+            ))
+            .unwrap();
+
+        let dropped = spool.retain_bridge_epoch(current_epoch).unwrap();
+
+        assert_eq!(dropped, 2);
+        assert_eq!(spool.events.len(), 1);
+        assert_eq!(spool.events[0].bridge_epoch, current_epoch);
+        assert_eq!(spool.max_sequence(), 3);
+
+        let reloaded = EventSpool::load(path.clone(), 8).unwrap();
+        assert_eq!(reloaded.events.len(), 1);
+        assert_eq!(reloaded.events[0].bridge_epoch, current_epoch);
         assert_eq!(reloaded.max_sequence(), 3);
         let _ = fs::remove_file(path);
     }
