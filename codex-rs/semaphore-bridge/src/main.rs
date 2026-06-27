@@ -1058,12 +1058,44 @@ async fn wait_for_turn_runner_with_control(
 ) -> Result<std::process::Output> {
     let output = tokio::time::timeout(Duration::from_secs(timeout_seconds), process.output());
     tokio::pin!(output);
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(args.heartbeat_seconds));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             result = &mut output => {
                 return result
                     .context("timed out waiting for semaphore-codex-runner")?
                     .context("failed to execute semaphore-codex-runner");
+            }
+            _ = heartbeat.tick() => {
+                let current_sequence = *sequence;
+                let event = heartbeat_event(
+                    args.organization_id,
+                    args.runtime_id,
+                    bridge_epoch,
+                    current_sequence,
+                    Utc::now(),
+                    args.drain_commands,
+                );
+                *sequence += 1;
+                match send_or_spool_event(transport, spool, &event, true).await {
+                    Ok(result) => {
+                        let commands = result.ack.commands.clone();
+                        if args.drain_commands {
+                            handle_active_turn_control_commands(
+                                args,
+                                transport,
+                                spool,
+                                bridge_epoch,
+                                sequence,
+                                active_turn_command,
+                                commands,
+                            )
+                            .await;
+                        }
+                    }
+                    Err(error) => eprintln!("Sandbox bridge active-turn heartbeat send failed: {error:#}"),
+                }
             }
             commands = transport.read_pushed_commands(), if args.drain_commands => {
                 match commands {
