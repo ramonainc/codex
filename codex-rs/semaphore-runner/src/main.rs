@@ -4676,6 +4676,14 @@ mod tests {
             payload["payloadSummary"]["questions"][0]["options"][0]["labelPreview"],
             "test-repo"
         );
+        assert_eq!(
+            payload["payloadSummary"]["questions"][0]["allowsOther"],
+            true
+        );
+        assert_eq!(
+            payload["payloadSummary"]["questions"][1]["requiresSensitiveInput"],
+            true
+        );
         assert!(payload["payloadSummary"].get("answers").is_none());
         assert!(payload["payloadSummary"].get("params").is_none());
     }
