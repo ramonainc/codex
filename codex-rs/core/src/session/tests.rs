@@ -9711,6 +9711,97 @@ async fn tool_calls_reopen_mailbox_delivery_for_current_turn() {
     );
 }
 
+#[tokio::test]
+async fn request_user_input_tool_call_emits_event_before_waiting_for_response() {
+    let (sess, tc, rx) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            config
+                .features
+                .enable(Feature::DefaultModeRequestUserInput)
+                .expect("request_user_input feature should enable for test");
+        },
+    )
+    .await;
+    *sess.active_turn.lock().await = Some(ActiveTurn::default());
+
+    let item = ResponseItem::FunctionCall {
+        id: None,
+        name: "request_user_input".to_string(),
+        namespace: None,
+        arguments: json!({
+            "questions": [
+                {
+                    "header": "Pick Repo",
+                    "id": "repo_choice",
+                    "question": "Which repository should you inspect first?",
+                    "options": [
+                        {
+                            "label": "ramonainc/test-repo (Recommended)",
+                            "description": "Start by inspecting ramonainc/test-repo before other repositories."
+                        },
+                        {
+                            "label": "ramonainc/test-repo-2",
+                            "description": "Start by inspecting ramonainc/test-repo-2 before other repositories."
+                        }
+                    ]
+                }
+            ],
+            "autoResolutionMs": 60000
+        })
+        .to_string(),
+        call_id: "request-input-call".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let cancellation_token = CancellationToken::new();
+    let mut ctx = HandleOutputCtx {
+        sess: Arc::clone(&sess),
+        turn_context: Arc::clone(&tc),
+        turn_store: Arc::new(codex_extension_api::ExtensionData::new(tc.sub_id.clone())),
+        tool_runtime: test_tool_runtime(Arc::clone(&sess), Arc::clone(&tc)),
+        cancellation_token: cancellation_token.clone(),
+    };
+
+    let mut output = handle_output_item_done(&mut ctx, item, /*previously_active_item*/ None)
+        .await
+        .expect("request_user_input call should be handled");
+
+    assert!(output.needs_follow_up);
+    assert!(output.tool_future.is_some());
+
+    let mut request = None;
+    for _ in 0..4 {
+        let event = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("request_user_input event should arrive before the tool future resolves")
+            .expect("request_user_input event should be readable");
+        if let EventMsg::RequestUserInput(candidate) = event.msg {
+            request = Some(candidate);
+            break;
+        }
+    }
+    let request = request.expect("request_user_input event should be emitted");
+    assert_eq!(request.call_id, "request-input-call");
+    assert_eq!(request.turn_id, tc.sub_id.to_string());
+    assert_eq!(request.auto_resolution_ms, Some(60000));
+    assert_eq!(request.questions.len(), 1);
+    let question = &request.questions[0];
+    assert_eq!(question.id, "repo_choice");
+    assert_eq!(question.header, "Pick Repo");
+    assert_eq!(
+        question
+            .options
+            .as_ref()
+            .expect("options should be present")
+            .len(),
+        2
+    );
+
+    cancellation_token.cancel();
+    drop(output.tool_future.take());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn abort_review_task_emits_exited_then_aborted_and_records_history() {
     let (sess, tc, rx) = make_session_and_context_with_rx().await;

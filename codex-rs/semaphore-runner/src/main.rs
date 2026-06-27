@@ -384,6 +384,7 @@ async fn ensure_thread(
                     approval_policy: Some(AskForApproval::Never),
                     approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
                     sandbox: Some(SandboxMode::DangerFullAccess),
+                    config: Some(semaphore_thread_config_overrides()),
                     initial_turns_page: Some(ThreadResumeInitialTurnsPageParams {
                         limit: Some(RESUME_HISTORY_TURN_LIMIT),
                         sort_direction: None,
@@ -414,7 +415,7 @@ async fn ensure_thread(
                 approval_policy: Some(AskForApproval::Never),
                 approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
                 sandbox: Some(SandboxMode::DangerFullAccess),
-                config: Some(semaphore_thread_start_config_overrides()),
+                config: Some(semaphore_thread_config_overrides()),
                 ephemeral: Some(false),
                 thread_source: Some(ThreadSource::Feature("semaphore_operator".to_string())),
                 experimental_raw_events: true,
@@ -882,7 +883,7 @@ fn optional_env(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn semaphore_thread_start_config_overrides() -> HashMap<String, Value> {
+fn semaphore_thread_config_overrides() -> HashMap<String, Value> {
     HashMap::from([(
         "features.default_mode_request_user_input".to_string(),
         json!(true),
@@ -3422,8 +3423,8 @@ mod tests {
     }
 
     #[test]
-    fn thread_start_config_enables_request_user_input_in_default_mode() {
-        let config = semaphore_thread_start_config_overrides();
+    fn thread_config_enables_request_user_input_in_default_mode() {
+        let config = semaphore_thread_config_overrides();
 
         assert_eq!(
             config.get("features.default_mode_request_user_input"),
