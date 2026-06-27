@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -37,6 +37,8 @@ const BRIDGE_REQUEST_TIMEOUT_SECONDS: u64 = 2;
 const RESUME_HISTORY_TURN_LIMIT: u32 = 8;
 const RESUME_HISTORY_COUNT_LIMIT: usize = 12;
 const REQUEST_USER_INPUT_REPLAY_DELAY: Duration = Duration::from_millis(250);
+const SERVER_REQUEST_REPLAY_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
+const SERVER_REQUEST_REPLAY_EVENT_LIMIT: usize = 8;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Semaphore runner for Codex app-server turns")]
@@ -185,6 +187,7 @@ struct TurnAccumulator {
     auto_approved_request_count: u64,
     user_input_request_count: u64,
     server_request_replay_attempted: bool,
+    handled_server_request_ids: HashSet<String>,
     interrupted: bool,
 }
 
@@ -316,6 +319,7 @@ async fn run_turn(command: TurnCommand) -> Result<()> {
             &client,
             &mut request_ids,
             event,
+            &command.websocket_url,
             &thread.id,
             &turn.turn.id,
             &command.model,
@@ -734,12 +738,13 @@ async fn handle_event(
     client: &RemoteAppServerClient,
     request_ids: &mut RequestIds,
     event: AppServerEvent,
+    websocket_url: &str,
     thread_id: &str,
     turn_id: &str,
     model: &str,
     cwd: Option<&str>,
     accumulator: &mut TurnAccumulator,
-    bridge: Option<&mut BridgeForwarder>,
+    mut bridge: Option<&mut BridgeForwarder>,
 ) -> Result<bool> {
     match event {
         AppServerEvent::Lagged { skipped } => {
@@ -749,46 +754,12 @@ async fn handle_event(
             bail!("Codex app-server disconnected: {message}");
         }
         AppServerEvent::ServerRequest(request) => {
-            accumulator.server_request_count += 1;
-            let method = server_request_method_name(&request);
-            if method == "item/tool/requestUserInput" {
-                accumulator.user_input_request_count += 1;
-            }
-            let server_request_id = server_request_id_string(&request);
-            let request_summary = server_request_payload_summary(&request);
-            if auto_resolve_server_request(client, request).await? {
-                accumulator.auto_approved_request_count += 1;
-                if let Some(bridge) = bridge {
-                    bridge
-                        .forward_server_request(
-                            &method,
-                            &server_request_id,
-                            turn_id,
-                            true,
-                            request_summary.as_ref(),
-                            accumulator.server_request_count,
-                            accumulator.event_count,
-                        )
-                        .await;
-                }
-            } else if let Some(bridge) = bridge {
-                bridge
-                    .forward_server_request(
-                        &method,
-                        &server_request_id,
-                        turn_id,
-                        false,
-                        request_summary.as_ref(),
-                        accumulator.server_request_count,
-                        accumulator.event_count,
-                    )
-                    .await;
-            }
+            handle_server_request_event(client, request, turn_id, accumulator, bridge).await?;
         }
         AppServerEvent::ServerNotification(notification) => {
             let waiting_on_server_request =
                 notification_waits_on_server_request(&notification, thread_id);
-            if let Some(bridge) = bridge {
+            if let Some(bridge) = bridge.as_mut() {
                 bridge
                     .forward_notification(&notification, accumulator.event_count)
                     .await;
@@ -797,15 +768,25 @@ async fn handle_event(
                 return Ok(true);
             }
             if waiting_on_server_request {
-                replay_pending_server_requests(
+                if let Err(error) = replay_pending_server_requests(
                     client,
                     request_ids,
+                    websocket_url,
                     thread_id,
+                    turn_id,
                     model,
                     cwd,
                     accumulator,
+                    bridge,
                 )
-                .await;
+                .await
+                {
+                    tracing::warn!(
+                        thread_id,
+                        error = %error,
+                        "failed to replay pending server request after waiting status"
+                    );
+                }
             }
         }
     }
@@ -815,13 +796,16 @@ async fn handle_event(
 async fn replay_pending_server_requests(
     client: &RemoteAppServerClient,
     request_ids: &mut RequestIds,
+    websocket_url: &str,
     thread_id: &str,
+    turn_id: &str,
     model: &str,
     cwd: Option<&str>,
     accumulator: &mut TurnAccumulator,
-) {
-    if accumulator.server_request_count > 0 || accumulator.server_request_replay_attempted {
-        return;
+    mut bridge: Option<&mut BridgeForwarder>,
+) -> Result<()> {
+    if accumulator.server_request_replay_attempted {
+        return Ok(());
     }
     accumulator.server_request_replay_attempted = true;
     tracing::warn!(
@@ -843,14 +827,137 @@ async fn replay_pending_server_requests(
     match result {
         Ok(_) => tracing::info!(
             thread_id,
-            "replayed pending server requests after waiting status"
+            "requested pending server request replay on primary connection after waiting status"
         ),
         Err(error) => tracing::warn!(
             thread_id,
             error = %error,
-            "failed to replay pending server requests after waiting status"
+            "failed to request pending server request replay on primary connection after waiting status"
         ),
     }
+
+    let mut replay_client = connect_app_server(websocket_url)
+        .await
+        .context("failed to connect temporary server request replay client")?;
+    replay_client
+        .request_typed::<ThreadResumeResponse>(ClientRequest::ThreadResume {
+            request_id: request_ids.next(),
+            params: semaphore_thread_resume_params(
+                thread_id.to_string(),
+                model.to_string(),
+                cwd.map(ToOwned::to_owned),
+                None,
+            ),
+        })
+        .await
+        .context("failed to request pending server request replay on temporary connection")?;
+
+    let mut replayed_request_count = 0_u64;
+    for _ in 0..SERVER_REQUEST_REPLAY_EVENT_LIMIT {
+        match timeout(
+            SERVER_REQUEST_REPLAY_EVENT_TIMEOUT,
+            replay_client.next_event(),
+        )
+        .await
+        {
+            Ok(Some(AppServerEvent::ServerRequest(request))) => {
+                accumulator.event_count += 1;
+                replayed_request_count += 1;
+                let replay_bridge = bridge.as_mut().map(|bridge| &mut **bridge);
+                handle_server_request_event(
+                    &replay_client,
+                    request,
+                    turn_id,
+                    accumulator,
+                    replay_bridge,
+                )
+                .await?;
+            }
+            Ok(Some(AppServerEvent::ServerNotification(notification))) => {
+                tracing::debug!(
+                    thread_id,
+                    method = notification_method_name(&notification),
+                    "ignored notification on temporary server request replay connection"
+                );
+            }
+            Ok(Some(AppServerEvent::Lagged { skipped })) => {
+                tracing::warn!(
+                    skipped,
+                    thread_id,
+                    "temporary server request replay connection lagged"
+                );
+            }
+            Ok(Some(AppServerEvent::Disconnected { message })) => {
+                tracing::warn!(
+                    thread_id,
+                    message,
+                    "temporary server request replay connection disconnected"
+                );
+                break;
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    if let Err(error) = replay_client.shutdown().await {
+        tracing::debug!(
+            thread_id,
+            error = %error,
+            "failed to shutdown temporary server request replay client"
+        );
+    }
+    tracing::info!(
+        thread_id,
+        replayed_request_count,
+        "temporary server request replay finished"
+    );
+    Ok(())
+}
+
+async fn handle_server_request_event(
+    client: &RemoteAppServerClient,
+    request: ServerRequest,
+    turn_id: &str,
+    accumulator: &mut TurnAccumulator,
+    bridge: Option<&mut BridgeForwarder>,
+) -> Result<()> {
+    let method = server_request_method_name(&request);
+    let server_request_id = server_request_id_string(&request);
+    if !accumulator
+        .handled_server_request_ids
+        .insert(server_request_id.clone())
+    {
+        tracing::info!(
+            server_request_id,
+            method,
+            "skipping duplicate server request"
+        );
+        return Ok(());
+    }
+
+    accumulator.server_request_count += 1;
+    if method == "item/tool/requestUserInput" {
+        accumulator.user_input_request_count += 1;
+    }
+    let request_summary = server_request_payload_summary(&request);
+    let auto_approved = auto_resolve_server_request(client, request).await?;
+    if auto_approved {
+        accumulator.auto_approved_request_count += 1;
+    }
+    if let Some(bridge) = bridge {
+        bridge
+            .forward_server_request(
+                &method,
+                &server_request_id,
+                turn_id,
+                auto_approved,
+                request_summary.as_ref(),
+                accumulator.server_request_count,
+                accumulator.event_count,
+            )
+            .await;
+    }
+    Ok(())
 }
 
 struct BridgeForwarder {
@@ -1128,7 +1235,17 @@ fn notification_waits_on_server_request_json(value: &Value, thread_id: &str) -> 
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .any(|flag| matches!(flag, "waitingOnUserInput" | "waitingOnApproval"))
+        .any(thread_active_flag_waits_on_server_request)
+}
+
+fn thread_active_flag_waits_on_server_request(flag: &str) -> bool {
+    matches!(
+        flag,
+        "waitingOnUserInput"
+            | "waitingOnApproval"
+            | "waiting_on_user_input"
+            | "waiting_on_approval"
+    )
 }
 
 fn server_request_bridge_payload(
@@ -4393,6 +4510,18 @@ mod tests {
                     "status": {
                         "type": "active",
                         "activeFlags": ["waitingOnUserInput"]
+                    }
+                }
+            }),
+            "thread-1"
+        ));
+        assert!(notification_waits_on_server_request_json(
+            &json!({
+                "method": "thread/status/changed",
+                "params": {
+                    "status": {
+                        "type": "active",
+                        "activeFlags": ["waiting_on_user_input"]
                     }
                 }
             }),
