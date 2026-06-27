@@ -2,6 +2,7 @@
 
 use core_test_support::test_codex::local_selections;
 use std::collections::HashMap;
+use std::future::Future;
 
 use codex_features::Feature;
 use codex_protocol::config_types::CollaborationMode;
@@ -25,6 +26,8 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
+use core_test_support::streaming_sse::StreamingSseChunk;
+use core_test_support::streaming_sse::start_streaming_sse_server;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
@@ -33,8 +36,32 @@ use core_test_support::wait_for_event_match;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
+use tokio::sync::oneshot;
 use tokio::time::Duration;
 use tokio::time::timeout;
+
+const REQUEST_USER_INPUT_TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
+
+fn run_request_user_input_test<F, Fut>(name: &'static str, test: F) -> anyhow::Result<()>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = anyhow::Result<()>> + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(REQUEST_USER_INPUT_TEST_STACK_SIZE_BYTES)
+        .spawn(move || -> anyhow::Result<()> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(test())
+        })?;
+
+    match handle.join() {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!("{name} thread panicked")),
+    }
+}
 
 fn call_output(req: &ResponsesRequest, call_id: &str) -> String {
     let raw = req.function_call_output(call_id);
@@ -66,14 +93,19 @@ fn call_output_content_and_success(
     (content, success)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn request_user_input_round_trip_resolves_pending() -> anyhow::Result<()> {
-    request_user_input_round_trip_for_mode(ModeKind::Plan, /*auto_resolution_ms*/ None).await
+#[test]
+fn request_user_input_round_trip_resolves_pending() -> anyhow::Result<()> {
+    run_request_user_input_test("request_user_input_round_trip_resolves_pending", || async {
+        request_user_input_round_trip_for_mode(ModeKind::Plan, /*auto_resolution_ms*/ None).await
+    })
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn request_user_input_round_trip_emits_auto_resolution_ms() -> anyhow::Result<()> {
-    request_user_input_round_trip_for_mode(ModeKind::Plan, Some(60_000)).await
+#[test]
+fn request_user_input_round_trip_emits_auto_resolution_ms() -> anyhow::Result<()> {
+    run_request_user_input_test(
+        "request_user_input_round_trip_emits_auto_resolution_ms",
+        || async { request_user_input_round_trip_for_mode(ModeKind::Plan, Some(60_000)).await },
+    )
 }
 
 async fn request_user_input_round_trip_for_mode(
@@ -248,94 +280,99 @@ fn ev_rate_limits() -> Value {
     })
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn request_user_input_interrupt_emits_deferred_token_count() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+#[test]
+fn request_user_input_interrupt_emits_deferred_token_count() -> anyhow::Result<()> {
+    run_request_user_input_test(
+        "request_user_input_interrupt_emits_deferred_token_count",
+        || async {
+            skip_if_no_network!(Ok(()));
 
-    let server = start_mock_server().await;
-    let TestCodex {
-        codex,
-        cwd,
-        session_configured,
-        ..
-    } = test_codex().build(&server).await?;
+            let server = start_mock_server().await;
+            let TestCodex {
+                codex,
+                cwd,
+                session_configured,
+                ..
+            } = test_codex().build(&server).await?;
 
-    let call_id = "user-input-interrupt";
-    let request_args = json!({
-        "questions": [{
-            "id": "confirm_path",
-            "header": "Confirm",
-            "question": "Proceed with the plan?",
-            "options": [{
-                "label": "Yes (Recommended)",
-                "description": "Continue the current plan."
-            }, {
-                "label": "No",
-                "description": "Stop and revisit the approach."
-            }]
-        }]
-    })
-    .to_string();
+            let call_id = "user-input-interrupt";
+            let request_args = json!({
+                "questions": [{
+                    "id": "confirm_path",
+                    "header": "Confirm",
+                    "question": "Proceed with the plan?",
+                    "options": [{
+                        "label": "Yes (Recommended)",
+                        "description": "Continue the current plan."
+                    }, {
+                        "label": "No",
+                        "description": "Stop and revisit the approach."
+                    }]
+                }]
+            })
+            .to_string();
 
-    let response = sse(vec![
-        ev_response_created("resp-interrupt"),
-        ev_function_call(call_id, "request_user_input", &request_args),
-        ev_completed_with_tokens("resp-interrupt", /*total_tokens*/ 77),
-    ]);
-    responses::mount_sse_once(&server, response).await;
+            let response = sse(vec![
+                ev_response_created("resp-interrupt"),
+                ev_function_call(call_id, "request_user_input", &request_args),
+                ev_completed_with_tokens("resp-interrupt", /*total_tokens*/ 77),
+            ]);
+            responses::mount_sse_once(&server, response).await;
 
-    let (sandbox_policy, permission_profile) =
-        turn_permission_fields(PermissionProfile::Disabled, cwd.path());
-    codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "please confirm".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
-                environments: Some(local_selections(cwd.abs())),
-                approval_policy: Some(AskForApproval::Never),
-                sandbox_policy: Some(sandbox_policy),
-                permission_profile,
-                collaboration_mode: Some(CollaborationMode {
-                    mode: ModeKind::Plan,
-                    settings: Settings {
-                        model: session_configured.model,
-                        reasoning_effort: None,
-                        developer_instructions: None,
+            let (sandbox_policy, permission_profile) =
+                turn_permission_fields(PermissionProfile::Disabled, cwd.path());
+            codex
+                .submit(Op::UserInput {
+                    items: vec![UserInput::Text {
+                        text: "please confirm".into(),
+                        text_elements: Vec::new(),
+                    }],
+                    final_output_json_schema: None,
+                    responsesapi_client_metadata: None,
+                    additional_context: Default::default(),
+                    thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                        environments: Some(local_selections(cwd.abs())),
+                        approval_policy: Some(AskForApproval::Never),
+                        sandbox_policy: Some(sandbox_policy),
+                        permission_profile,
+                        collaboration_mode: Some(CollaborationMode {
+                            mode: ModeKind::Plan,
+                            settings: Settings {
+                                model: session_configured.model,
+                                reasoning_effort: None,
+                                developer_instructions: None,
+                            },
+                        }),
+                        ..Default::default()
                     },
-                }),
-                ..Default::default()
-            },
-        })
-        .await?;
+                })
+                .await?;
 
-    let request = wait_for_event_match(&codex, |event| match event {
-        EventMsg::RequestUserInput(request) => Some(request.clone()),
-        _ => None,
-    })
-    .await;
+            let request = wait_for_event_match(&codex, |event| match event {
+                EventMsg::RequestUserInput(request) => Some(request.clone()),
+                _ => None,
+            })
+            .await;
 
-    codex.submit(Op::Interrupt).await?;
+            codex.submit(Op::Interrupt).await?;
 
-    let token_count = wait_for_event_match(&codex, |event| match event {
-        EventMsg::TokenCount(token_count) => Some(token_count.clone()),
-        _ => None,
-    })
-    .await;
-    assert_eq!(
-        token_count
-            .info
-            .map(|info| info.total_token_usage.total_tokens),
-        Some(77)
-    );
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnAborted(_))).await;
+            let token_count = wait_for_event_match(&codex, |event| match event {
+                EventMsg::TokenCount(token_count) => Some(token_count.clone()),
+                _ => None,
+            })
+            .await;
+            assert_eq!(
+                token_count
+                    .info
+                    .map(|info| info.total_token_usage.total_tokens),
+                Some(77)
+            );
+            wait_for_event(&codex, |event| matches!(event, EventMsg::TurnAborted(_))).await;
 
-    assert_eq!(request.call_id, call_id);
-    Ok(())
+            assert_eq!(request.call_id, call_id);
+            Ok(())
+        },
+    )
 }
 
 async fn assert_request_user_input_rejected<F>(mode_name: &str, build_mode: F) -> anyhow::Result<()>
@@ -423,46 +460,215 @@ where
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn request_user_input_rejected_in_execute_mode_alias() -> anyhow::Result<()> {
-    assert_request_user_input_rejected("Execute", |model| CollaborationMode {
-        mode: ModeKind::Execute,
-        settings: Settings {
-            model,
-            reasoning_effort: None,
-            developer_instructions: None,
+#[test]
+fn request_user_input_rejected_in_execute_mode_alias() -> anyhow::Result<()> {
+    run_request_user_input_test(
+        "request_user_input_rejected_in_execute_mode_alias",
+        || async {
+            assert_request_user_input_rejected("Execute", |model| CollaborationMode {
+                mode: ModeKind::Execute,
+                settings: Settings {
+                    model,
+                    reasoning_effort: None,
+                    developer_instructions: None,
+                },
+            })
+            .await
         },
-    })
-    .await
+    )
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn request_user_input_rejected_in_default_mode_by_default() -> anyhow::Result<()> {
-    assert_request_user_input_rejected("Default", |model| CollaborationMode {
-        mode: ModeKind::Default,
-        settings: Settings {
-            model,
-            reasoning_effort: None,
-            developer_instructions: None,
+#[test]
+fn request_user_input_rejected_in_default_mode_by_default() -> anyhow::Result<()> {
+    run_request_user_input_test(
+        "request_user_input_rejected_in_default_mode_by_default",
+        || async {
+            assert_request_user_input_rejected("Default", |model| CollaborationMode {
+                mode: ModeKind::Default,
+                settings: Settings {
+                    model,
+                    reasoning_effort: None,
+                    developer_instructions: None,
+                },
+            })
+            .await
         },
-    })
-    .await
+    )
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn request_user_input_round_trip_in_default_mode_with_feature() -> anyhow::Result<()> {
-    request_user_input_round_trip_for_mode(ModeKind::Default, /*auto_resolution_ms*/ None).await
+#[test]
+fn request_user_input_round_trip_in_default_mode_with_feature() -> anyhow::Result<()> {
+    run_request_user_input_test(
+        "request_user_input_round_trip_in_default_mode_with_feature",
+        || async {
+            request_user_input_round_trip_for_mode(
+                ModeKind::Default,
+                /*auto_resolution_ms*/ None,
+            )
+            .await
+        },
+    )
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn request_user_input_rejected_in_pair_mode_alias() -> anyhow::Result<()> {
-    assert_request_user_input_rejected("Pair Programming", |model| CollaborationMode {
-        mode: ModeKind::PairProgramming,
-        settings: Settings {
-            model,
-            reasoning_effort: None,
-            developer_instructions: None,
+#[test]
+fn request_user_input_dispatches_before_response_completed() -> anyhow::Result<()> {
+    run_request_user_input_test(
+        "request_user_input_dispatches_before_response_completed",
+        || async {
+            skip_if_no_network!(Ok(()));
+
+            let (release_completed, completed_gate) = oneshot::channel();
+            let call_id = "user-input-before-completed";
+            let request_args = json!({
+                "questions": [{
+                    "id": "confirm_path",
+                    "header": "Confirm",
+                    "question": "Proceed with the plan?",
+                    "options": [{
+                        "label": "Yes (Recommended)",
+                        "description": "Continue the current plan."
+                    }, {
+                        "label": "No",
+                        "description": "Stop and revisit the approach."
+                    }]
+                }]
+            })
+            .to_string();
+
+            let first_response_prefix = sse(vec![
+                ev_response_created("resp-1"),
+                ev_function_call(call_id, "request_user_input", &request_args),
+            ]);
+            let first_response_completion = sse(vec![ev_completed("resp-1")]);
+            let second_response = sse(vec![
+                ev_assistant_message("msg-1", "thanks"),
+                ev_completed("resp-2"),
+            ]);
+            let (server, mut completions) = start_streaming_sse_server(vec![
+                vec![
+                    StreamingSseChunk {
+                        gate: None,
+                        body: first_response_prefix,
+                    },
+                    StreamingSseChunk {
+                        gate: Some(completed_gate),
+                        body: first_response_completion,
+                    },
+                ],
+                vec![StreamingSseChunk {
+                    gate: None,
+                    body: second_response,
+                }],
+            ])
+            .await;
+
+            let mut first_stream_completed = completions.remove(0);
+            let builder = test_codex();
+            let TestCodex {
+                codex,
+                cwd,
+                session_configured,
+                ..
+            } = builder
+                .with_config(|config| {
+                    config
+                        .features
+                        .enable(Feature::DefaultModeRequestUserInput)
+                        .expect("test config should allow feature update");
+                })
+                .build_with_streaming_server(&server)
+                .await?;
+
+            let (sandbox_policy, permission_profile) =
+                turn_permission_fields(PermissionProfile::Disabled, cwd.path());
+
+            codex
+                .submit(Op::UserInput {
+                    items: vec![UserInput::Text {
+                        text: "please confirm".into(),
+                        text_elements: Vec::new(),
+                    }],
+                    final_output_json_schema: None,
+                    responsesapi_client_metadata: None,
+                    additional_context: Default::default(),
+                    thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                        environments: Some(local_selections(cwd.abs())),
+                        approval_policy: Some(AskForApproval::Never),
+                        sandbox_policy: Some(sandbox_policy),
+                        permission_profile,
+                        collaboration_mode: Some(CollaborationMode {
+                            mode: ModeKind::Default,
+                            settings: Settings {
+                                model: session_configured.model.clone(),
+                                reasoning_effort: None,
+                                developer_instructions: None,
+                            },
+                        }),
+                        ..Default::default()
+                    },
+                })
+                .await?;
+
+            let request = wait_for_event_match(&codex, |event| match event {
+                EventMsg::RequestUserInput(request) => Some(request.clone()),
+                _ => None,
+            })
+            .await;
+            assert_eq!(request.call_id, call_id);
+            assert!(
+                timeout(Duration::from_millis(200), &mut first_stream_completed)
+                    .await
+                    .is_err(),
+                "request_user_input should dispatch before response.completed is received"
+            );
+
+            let mut answers = HashMap::new();
+            answers.insert(
+                "confirm_path".to_string(),
+                RequestUserInputAnswer {
+                    answers: vec!["yes".to_string()],
+                },
+            );
+            codex
+                .submit(Op::UserInputAnswer {
+                    id: request.turn_id.clone(),
+                    response: RequestUserInputResponse { answers },
+                })
+                .await?;
+            release_completed
+                .send(())
+                .expect("test should still be holding response.completed gate");
+
+            wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+            server.wait_for_request_count(2).await;
+            let requests = server.requests().await;
+            let second_request: Value = serde_json::from_slice(&requests[1])?;
+            let second_input = second_request
+                .get("input")
+                .and_then(Value::as_array)
+                .expect("second request should include response input");
+            assert!(second_input.iter().any(|item| {
+                item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                    && item.get("call_id").and_then(Value::as_str) == Some(call_id)
+            }));
+            server.shutdown().await;
+
+            Ok(())
         },
+    )
+}
+
+#[test]
+fn request_user_input_rejected_in_pair_mode_alias() -> anyhow::Result<()> {
+    run_request_user_input_test("request_user_input_rejected_in_pair_mode_alias", || async {
+        assert_request_user_input_rejected("Pair Programming", |model| CollaborationMode {
+            mode: ModeKind::PairProgramming,
+            settings: Settings {
+                model,
+                reasoning_effort: None,
+                developer_instructions: None,
+            },
+        })
+        .await
     })
-    .await
 }

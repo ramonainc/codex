@@ -16,7 +16,13 @@ use crate::function_tool::FunctionCallError;
 use crate::parse_turn_item;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
+use crate::tools::context::ToolPayload;
+use crate::tools::handlers::parse_arguments;
+use crate::tools::handlers::request_user_input_spec::REQUEST_USER_INPUT_TOOL_NAME;
+use crate::tools::handlers::request_user_input_spec::normalize_request_user_input_args;
+use crate::tools::handlers::request_user_input_spec::request_user_input_unavailable_message;
 use crate::tools::parallel::ToolCallRuntime;
+use crate::tools::router::ToolCall;
 use crate::tools::router::ToolRouter;
 use codex_memories_read::citations::parse_memory_citation;
 use codex_memories_read::citations::thread_ids_from_memory_citation;
@@ -28,7 +34,9 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_rollout::state_db;
+use codex_tools::request_user_input_available_modes;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_stream_parser::strip_proposed_plan_blocks;
 use futures::Future;
@@ -321,6 +329,114 @@ pub(crate) struct HandleOutputCtx {
     pub cancellation_token: CancellationToken,
 }
 
+fn request_user_input_response(
+    call_id: String,
+    text: String,
+    success: Option<bool>,
+) -> ResponseInputItem {
+    ResponseInputItem::FunctionCallOutput {
+        call_id,
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::Text(text),
+            success,
+        },
+    }
+}
+
+fn request_user_input_failure_response(
+    call_id: String,
+    message: impl Into<String>,
+) -> ResponseInputItem {
+    request_user_input_response(call_id, message.into(), Some(false))
+}
+
+async fn pre_completion_request_user_input_future(
+    ctx: &HandleOutputCtx,
+    call: &ToolCall,
+) -> Option<InFlightFuture<'static>> {
+    if call.tool_name.namespace.is_some() || call.tool_name.name != REQUEST_USER_INPUT_TOOL_NAME {
+        return None;
+    }
+
+    let payload = call.payload.clone();
+    let call_id = call.call_id.clone();
+    let sess = Arc::clone(&ctx.sess);
+    let turn_context = Arc::clone(&ctx.turn_context);
+
+    let arguments = match payload {
+        ToolPayload::Function { arguments } => arguments,
+        _ => {
+            return Some(Box::pin(async move {
+                Ok(request_user_input_failure_response(
+                    call_id,
+                    format!("{REQUEST_USER_INPUT_TOOL_NAME} handler received unsupported payload"),
+                ))
+            }));
+        }
+    };
+
+    if turn_context.session_source.is_non_root_agent() {
+        return Some(Box::pin(async move {
+            Ok(request_user_input_failure_response(
+                call_id,
+                "request_user_input can only be used by the root thread",
+            ))
+        }));
+    }
+
+    let mode = sess.collaboration_mode().await.mode;
+    let available_modes = request_user_input_available_modes(turn_context.config.features.get());
+    if let Some(message) = request_user_input_unavailable_message(mode, &available_modes) {
+        return Some(Box::pin(async move {
+            Ok(request_user_input_failure_response(call_id, message))
+        }));
+    }
+
+    let args: RequestUserInputArgs = match parse_arguments(&arguments).and_then(|args| {
+        normalize_request_user_input_args(args).map_err(FunctionCallError::RespondToModel)
+    }) {
+        Ok(args) => args,
+        Err(err) => {
+            return Some(Box::pin(async move {
+                Ok(request_user_input_failure_response(
+                    call_id,
+                    err.to_string(),
+                ))
+            }));
+        }
+    };
+
+    let rx_response = sess
+        .begin_request_user_input(turn_context.as_ref(), call_id.clone(), args)
+        .await;
+    let cancellation_token = ctx.cancellation_token.child_token();
+
+    Some(Box::pin(async move {
+        let response = match tokio::select! {
+            response = rx_response => response.ok(),
+            _ = cancellation_token.cancelled() => None,
+        } {
+            Some(response) => response,
+            None => {
+                return Ok(request_user_input_failure_response(
+                    call_id,
+                    format!(
+                        "{REQUEST_USER_INPUT_TOOL_NAME} was cancelled before receiving a response"
+                    ),
+                ));
+            }
+        };
+
+        let content = serde_json::to_string(&response).map_err(|err| {
+            CodexErr::Fatal(format!(
+                "failed to serialize {REQUEST_USER_INPUT_TOOL_NAME} response: {err}"
+            ))
+        })?;
+
+        Ok(request_user_input_response(call_id, content, Some(true)))
+    }))
+}
+
 async fn apply_turn_item_contributors(
     sess: &Session,
     turn_store: &ExtensionData,
@@ -432,15 +548,21 @@ pub(crate) async fn handle_output_item_done(
             record_completed_response_item(ctx.sess.as_ref(), ctx.turn_context.as_ref(), &item)
                 .await;
 
-            let cancellation_token = ctx.cancellation_token.child_token();
-            let tool_future: InFlightFuture<'static> = Box::pin(
-                ctx.tool_runtime
-                    .clone()
-                    .handle_tool_call(call, cancellation_token),
-            );
+            if let Some(tool_future) =
+                Box::pin(pre_completion_request_user_input_future(ctx, &call)).await
+            {
+                output.tool_future = Some(tool_future);
+            } else {
+                let cancellation_token = ctx.cancellation_token.child_token();
+                let tool_future: InFlightFuture<'static> = Box::pin(
+                    ctx.tool_runtime
+                        .clone()
+                        .handle_tool_call(call, cancellation_token),
+                );
+                output.tool_future = Some(tool_future);
+            }
 
             output.needs_follow_up = true;
-            output.tool_future = Some(tool_future);
         }
         // No tool call: convert messages/reasoning into turn items and mark them as complete.
         Ok(None) => {

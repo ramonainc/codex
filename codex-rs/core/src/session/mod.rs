@@ -2408,12 +2408,12 @@ impl Session {
         clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state updates must remain atomic"
     )]
-    pub async fn request_user_input(
+    pub async fn begin_request_user_input(
         &self,
         turn_context: &TurnContext,
         call_id: String,
         args: RequestUserInputArgs,
-    ) -> Option<RequestUserInputResponse> {
+    ) -> oneshot::Receiver<RequestUserInputResponse> {
         let sub_id = turn_context.sub_id.clone();
         let (tx_response, rx_response) = oneshot::channel();
         let event_id = sub_id.clone();
@@ -2441,6 +2441,18 @@ impl Session {
             .turn_metadata_state
             .mark_user_input_requested_during_turn();
         self.send_event(turn_context, event).await;
+        rx_response
+    }
+
+    pub async fn request_user_input(
+        &self,
+        turn_context: &TurnContext,
+        call_id: String,
+        args: RequestUserInputArgs,
+    ) -> Option<RequestUserInputResponse> {
+        let rx_response = self
+            .begin_request_user_input(turn_context, call_id, args)
+            .await;
         rx_response.await.ok()
     }
 
