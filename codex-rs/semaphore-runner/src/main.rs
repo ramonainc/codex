@@ -184,7 +184,7 @@ struct TurnAccumulator {
     server_request_count: u64,
     auto_approved_request_count: u64,
     user_input_request_count: u64,
-    user_input_replay_attempted: bool,
+    server_request_replay_attempted: bool,
     interrupted: bool,
 }
 
@@ -786,8 +786,8 @@ async fn handle_event(
             }
         }
         AppServerEvent::ServerNotification(notification) => {
-            let waiting_on_user_input =
-                notification_waits_on_user_input(&notification, thread_id, turn_id);
+            let waiting_on_server_request =
+                notification_waits_on_server_request(&notification, thread_id);
             if let Some(bridge) = bridge {
                 bridge
                     .forward_notification(&notification, accumulator.event_count)
@@ -796,8 +796,8 @@ async fn handle_event(
             if handle_notification(notification, thread_id, turn_id, accumulator)? {
                 return Ok(true);
             }
-            if waiting_on_user_input {
-                replay_pending_user_input_request(
+            if waiting_on_server_request {
+                replay_pending_server_requests(
                     client,
                     request_ids,
                     thread_id,
@@ -812,7 +812,7 @@ async fn handle_event(
     Ok(false)
 }
 
-async fn replay_pending_user_input_request(
+async fn replay_pending_server_requests(
     client: &RemoteAppServerClient,
     request_ids: &mut RequestIds,
     thread_id: &str,
@@ -820,13 +820,13 @@ async fn replay_pending_user_input_request(
     cwd: Option<&str>,
     accumulator: &mut TurnAccumulator,
 ) {
-    if accumulator.user_input_request_count > 0 || accumulator.user_input_replay_attempted {
+    if accumulator.server_request_count > 0 || accumulator.server_request_replay_attempted {
         return;
     }
-    accumulator.user_input_replay_attempted = true;
+    accumulator.server_request_replay_attempted = true;
     tracing::warn!(
         thread_id,
-        "thread is waiting on request_user_input but no server request has been observed; replaying pending requests"
+        "thread is waiting on a server request but no server request has been observed; replaying pending requests"
     );
     sleep(REQUEST_USER_INPUT_REPLAY_DELAY).await;
     let result = client
@@ -843,12 +843,12 @@ async fn replay_pending_user_input_request(
     match result {
         Ok(_) => tracing::info!(
             thread_id,
-            "replayed pending request_user_input server requests after waiting status"
+            "replayed pending server requests after waiting status"
         ),
         Err(error) => tracing::warn!(
             thread_id,
             error = %error,
-            "failed to replay pending request_user_input server requests after waiting status"
+            "failed to replay pending server requests after waiting status"
         ),
     }
 }
@@ -1097,18 +1097,23 @@ fn notification_bridge_payload(
     })
 }
 
-fn notification_waits_on_user_input(
+fn notification_waits_on_server_request(
     notification: &ServerNotification,
     thread_id: &str,
-    _turn_id: &str,
 ) -> bool {
     let Ok(value) = serde_json::to_value(notification) else {
         return false;
     };
+    notification_waits_on_server_request_json(&value, thread_id)
+}
+
+fn notification_waits_on_server_request_json(value: &Value, thread_id: &str) -> bool {
     if value.get("method").and_then(Value::as_str) != Some("thread/status/changed") {
         return false;
     }
-    if notification_param_string(&value, "threadId").as_deref() != Some(thread_id) {
+    if let Some(notification_thread_id) = notification_param_string(&value, "threadId")
+        && notification_thread_id != thread_id
+    {
         return false;
     }
     let Some(status) = value.get("params").and_then(|params| params.get("status")) else {
@@ -1123,7 +1128,7 @@ fn notification_waits_on_user_input(
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .any(|flag| flag == "waitingOnUserInput")
+        .any(|flag| matches!(flag, "waitingOnUserInput" | "waitingOnApproval"))
 }
 
 fn server_request_bridge_payload(
@@ -4348,7 +4353,7 @@ mod tests {
     }
 
     #[test]
-    fn notification_waits_on_user_input_detects_active_thread_status() {
+    fn notification_waits_on_server_request_detects_active_thread_status() {
         let notification =
             ServerNotification::ThreadStatusChanged(ThreadStatusChangedNotification {
                 thread_id: "thread-1".to_string(),
@@ -4360,15 +4365,13 @@ mod tests {
                 },
             });
 
-        assert!(notification_waits_on_user_input(
+        assert!(notification_waits_on_server_request(
             &notification,
-            "thread-1",
-            "turn-1"
+            "thread-1"
         ));
-        assert!(!notification_waits_on_user_input(
+        assert!(!notification_waits_on_server_request(
             &notification,
-            "thread-2",
-            "turn-1"
+            "thread-2"
         ));
 
         let approval_only =
@@ -4378,19 +4381,42 @@ mod tests {
                     active_flags: vec![ThreadActiveFlag::WaitingOnApproval],
                 },
             });
-        assert!(!notification_waits_on_user_input(
+        assert!(notification_waits_on_server_request(
             &approval_only,
-            "thread-1",
-            "turn-1"
+            "thread-1"
+        ));
+
+        assert!(notification_waits_on_server_request_json(
+            &json!({
+                "method": "thread/status/changed",
+                "params": {
+                    "status": {
+                        "type": "active",
+                        "activeFlags": ["waitingOnUserInput"]
+                    }
+                }
+            }),
+            "thread-1"
+        ));
+        assert!(!notification_waits_on_server_request_json(
+            &json!({
+                "method": "thread/status/changed",
+                "params": {
+                    "threadId": "thread-2",
+                    "status": {
+                        "type": "active",
+                        "activeFlags": ["waitingOnUserInput"]
+                    }
+                }
+            }),
+            "thread-1"
         ));
 
         let idle = ServerNotification::ThreadStatusChanged(ThreadStatusChangedNotification {
             thread_id: "thread-1".to_string(),
             status: ThreadStatus::Idle,
         });
-        assert!(!notification_waits_on_user_input(
-            &idle, "thread-1", "turn-1"
-        ));
+        assert!(!notification_waits_on_server_request(&idle, "thread-1"));
     }
 
     #[test]
