@@ -377,21 +377,16 @@ async fn ensure_thread(
         let resumed: ThreadResumeResponse = client
             .request_typed(ClientRequest::ThreadResume {
                 request_id: request_ids.next(),
-                params: ThreadResumeParams {
+                params: semaphore_thread_resume_params(
                     thread_id,
-                    model: Some(command.model.clone()),
-                    cwd: cwd_string,
-                    approval_policy: Some(AskForApproval::Never),
-                    approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
-                    sandbox: Some(SandboxMode::DangerFullAccess),
-                    config: Some(semaphore_thread_config_overrides()),
-                    initial_turns_page: Some(ThreadResumeInitialTurnsPageParams {
+                    command.model.clone(),
+                    cwd_string,
+                    Some(ThreadResumeInitialTurnsPageParams {
                         limit: Some(RESUME_HISTORY_TURN_LIMIT),
                         sort_direction: None,
                         items_view: Some(TurnItemsView::Summary),
                     }),
-                    ..ThreadResumeParams::default()
-                },
+                ),
             })
             .await
             .context("thread/resume failed")?;
@@ -411,7 +406,7 @@ async fn ensure_thread(
             params: ThreadStartParams {
                 model: Some(command.model.clone()),
                 model_provider: Some("openai".to_string()),
-                cwd: cwd_string,
+                cwd: cwd_string.clone(),
                 approval_policy: Some(AskForApproval::Never),
                 approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
                 sandbox: Some(SandboxMode::DangerFullAccess),
@@ -424,6 +419,18 @@ async fn ensure_thread(
         })
         .await
         .context("thread/start failed")?;
+    let _: ThreadResumeResponse = client
+        .request_typed(ClientRequest::ThreadResume {
+            request_id: request_ids.next(),
+            params: semaphore_thread_resume_params(
+                started.thread.id.clone(),
+                command.model.clone(),
+                cwd_string,
+                None,
+            ),
+        })
+        .await
+        .context("thread/resume after thread/start failed")?;
     Ok(PreparedThread {
         id: started.thread.id,
         session_id: started.thread.session_id,
@@ -888,6 +895,25 @@ fn semaphore_thread_config_overrides() -> HashMap<String, Value> {
         "features.default_mode_request_user_input".to_string(),
         json!(true),
     )])
+}
+
+fn semaphore_thread_resume_params(
+    thread_id: String,
+    model: String,
+    cwd: Option<String>,
+    initial_turns_page: Option<ThreadResumeInitialTurnsPageParams>,
+) -> ThreadResumeParams {
+    ThreadResumeParams {
+        thread_id,
+        model: Some(model),
+        cwd,
+        approval_policy: Some(AskForApproval::Never),
+        approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
+        sandbox: Some(SandboxMode::DangerFullAccess),
+        config: Some(semaphore_thread_config_overrides()),
+        initial_turns_page,
+        ..ThreadResumeParams::default()
+    }
 }
 
 fn clean_optional_string(value: Option<&str>) -> Option<String> {
@@ -3430,6 +3456,34 @@ mod tests {
             config.get("features.default_mode_request_user_input"),
             Some(&json!(true))
         );
+    }
+
+    #[test]
+    fn thread_resume_params_enable_request_user_input_and_operator_policy() {
+        let params = semaphore_thread_resume_params(
+            "thread-1".to_string(),
+            "gpt-validation".to_string(),
+            Some("/workspace/project".to_string()),
+            None,
+        );
+
+        assert_eq!(params.thread_id, "thread-1");
+        assert_eq!(params.model.as_deref(), Some("gpt-validation"));
+        assert_eq!(params.cwd.as_deref(), Some("/workspace/project"));
+        assert_eq!(params.approval_policy, Some(AskForApproval::Never));
+        assert_eq!(
+            params.approvals_reviewer,
+            Some(ApprovalsReviewer::AutoReview)
+        );
+        assert_eq!(params.sandbox, Some(SandboxMode::DangerFullAccess));
+        assert_eq!(
+            params
+                .config
+                .as_ref()
+                .and_then(|config| config.get("features.default_mode_request_user_input")),
+            Some(&json!(true))
+        );
+        assert!(params.initial_turns_page.is_none());
     }
 
     #[test]
