@@ -36,8 +36,10 @@ const BRIDGE_SCHEMA_VERSION: i32 = 1;
 const BRIDGE_REQUEST_TIMEOUT_SECONDS: u64 = 2;
 const RESUME_HISTORY_TURN_LIMIT: u32 = 8;
 const RESUME_HISTORY_COUNT_LIMIT: usize = 12;
-const REQUEST_USER_INPUT_REPLAY_DELAY: Duration = Duration::from_millis(250);
-const SERVER_REQUEST_REPLAY_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
+const SERVER_REQUEST_REPLAY_ATTEMPTS: usize = 20;
+const SERVER_REQUEST_REPLAY_INITIAL_DELAY: Duration = Duration::from_millis(250);
+const SERVER_REQUEST_REPLAY_RETRY_DELAY: Duration = Duration::from_millis(500);
+const SERVER_REQUEST_REPLAY_EVENT_TIMEOUT: Duration = Duration::from_secs(1);
 const SERVER_REQUEST_REPLAY_EVENT_LIMIT: usize = 8;
 
 #[derive(Debug, Parser)]
@@ -186,7 +188,7 @@ struct TurnAccumulator {
     server_request_count: u64,
     auto_approved_request_count: u64,
     user_input_request_count: u64,
-    server_request_replay_attempted: bool,
+    server_request_replay_attempt_count: u64,
     handled_server_request_ids: HashSet<String>,
     interrupted: bool,
 }
@@ -804,112 +806,161 @@ async fn replay_pending_server_requests(
     accumulator: &mut TurnAccumulator,
     mut bridge: Option<&mut BridgeForwarder>,
 ) -> Result<()> {
-    if accumulator.server_request_replay_attempted {
-        return Ok(());
-    }
-    accumulator.server_request_replay_attempted = true;
+    accumulator.server_request_replay_attempt_count += 1;
     tracing::warn!(
         thread_id,
+        attempt_count = accumulator.server_request_replay_attempt_count,
         "thread is waiting on a server request but no server request has been observed; replaying pending requests"
     );
-    sleep(REQUEST_USER_INPUT_REPLAY_DELAY).await;
-    let result = client
-        .request_typed::<ThreadResumeResponse>(ClientRequest::ThreadResume {
-            request_id: request_ids.next(),
-            params: semaphore_thread_resume_params(
-                thread_id.to_string(),
-                model.to_string(),
-                cwd.map(ToOwned::to_owned),
-                None,
+    let server_request_count_before_replay = accumulator.server_request_count;
+    let mut total_replayed_request_count = 0_u64;
+    for attempt in 1..=SERVER_REQUEST_REPLAY_ATTEMPTS {
+        let delay = if attempt == 1 {
+            SERVER_REQUEST_REPLAY_INITIAL_DELAY
+        } else {
+            SERVER_REQUEST_REPLAY_RETRY_DELAY
+        };
+        sleep(delay).await;
+        let result = client
+            .request_typed::<ThreadResumeResponse>(ClientRequest::ThreadResume {
+                request_id: request_ids.next(),
+                params: semaphore_thread_resume_params(
+                    thread_id.to_string(),
+                    model.to_string(),
+                    cwd.map(ToOwned::to_owned),
+                    None,
+                ),
+            })
+            .await;
+        match result {
+            Ok(_) => tracing::info!(
+                thread_id,
+                attempt,
+                "requested pending server request replay on primary connection after waiting status"
             ),
-        })
-        .await;
-    match result {
-        Ok(_) => tracing::info!(
-            thread_id,
-            "requested pending server request replay on primary connection after waiting status"
-        ),
-        Err(error) => tracing::warn!(
-            thread_id,
-            error = %error,
-            "failed to request pending server request replay on primary connection after waiting status"
-        ),
-    }
-
-    let mut replay_client = connect_app_server(websocket_url)
-        .await
-        .context("failed to connect temporary server request replay client")?;
-    replay_client
-        .request_typed::<ThreadResumeResponse>(ClientRequest::ThreadResume {
-            request_id: request_ids.next(),
-            params: semaphore_thread_resume_params(
-                thread_id.to_string(),
-                model.to_string(),
-                cwd.map(ToOwned::to_owned),
-                None,
+            Err(error) => tracing::warn!(
+                thread_id,
+                attempt,
+                error = %error,
+                "failed to request pending server request replay on primary connection after waiting status"
             ),
-        })
-        .await
-        .context("failed to request pending server request replay on temporary connection")?;
+        }
 
-    let mut replayed_request_count = 0_u64;
-    for _ in 0..SERVER_REQUEST_REPLAY_EVENT_LIMIT {
-        match timeout(
-            SERVER_REQUEST_REPLAY_EVENT_TIMEOUT,
-            replay_client.next_event(),
-        )
-        .await
-        {
-            Ok(Some(AppServerEvent::ServerRequest(request))) => {
-                accumulator.event_count += 1;
-                replayed_request_count += 1;
-                let replay_bridge = bridge.as_mut().map(|bridge| &mut **bridge);
-                handle_server_request_event(
-                    &replay_client,
-                    request,
-                    turn_id,
-                    accumulator,
-                    replay_bridge,
-                )
-                .await?;
+        let mut replay_client = match connect_app_server(websocket_url).await {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(
+                    thread_id,
+                    attempt,
+                    error = %error,
+                    "failed to connect temporary server request replay client"
+                );
+                continue;
             }
-            Ok(Some(AppServerEvent::ServerNotification(notification))) => {
+        };
+        let resume_result = replay_client
+            .request_typed::<ThreadResumeResponse>(ClientRequest::ThreadResume {
+                request_id: request_ids.next(),
+                params: semaphore_thread_resume_params(
+                    thread_id.to_string(),
+                    model.to_string(),
+                    cwd.map(ToOwned::to_owned),
+                    None,
+                ),
+            })
+            .await;
+        if let Err(error) = resume_result {
+            tracing::warn!(
+                thread_id,
+                attempt,
+                error = %error,
+                "failed to request pending server request replay on temporary connection"
+            );
+            if let Err(error) = replay_client.shutdown().await {
                 tracing::debug!(
                     thread_id,
-                    method = notification_method_name(&notification),
-                    "ignored notification on temporary server request replay connection"
+                    attempt,
+                    error = %error,
+                    "failed to shutdown temporary server request replay client"
                 );
             }
-            Ok(Some(AppServerEvent::Lagged { skipped })) => {
-                tracing::warn!(
-                    skipped,
-                    thread_id,
-                    "temporary server request replay connection lagged"
-                );
+            continue;
+        }
+
+        let mut replayed_request_count = 0_u64;
+        for _ in 0..SERVER_REQUEST_REPLAY_EVENT_LIMIT {
+            match timeout(
+                SERVER_REQUEST_REPLAY_EVENT_TIMEOUT,
+                replay_client.next_event(),
+            )
+            .await
+            {
+                Ok(Some(AppServerEvent::ServerRequest(request))) => {
+                    accumulator.event_count += 1;
+                    replayed_request_count += 1;
+                    total_replayed_request_count += 1;
+                    let replay_bridge = bridge.as_mut().map(|bridge| &mut **bridge);
+                    handle_server_request_event(
+                        &replay_client,
+                        request,
+                        turn_id,
+                        accumulator,
+                        replay_bridge,
+                    )
+                    .await?;
+                }
+                Ok(Some(AppServerEvent::ServerNotification(notification))) => {
+                    tracing::debug!(
+                        thread_id,
+                        attempt,
+                        method = notification_method_name(&notification),
+                        "ignored notification on temporary server request replay connection"
+                    );
+                }
+                Ok(Some(AppServerEvent::Lagged { skipped })) => {
+                    tracing::warn!(
+                        skipped,
+                        thread_id,
+                        attempt,
+                        "temporary server request replay connection lagged"
+                    );
+                }
+                Ok(Some(AppServerEvent::Disconnected { message })) => {
+                    tracing::warn!(
+                        thread_id,
+                        attempt,
+                        message,
+                        "temporary server request replay connection disconnected"
+                    );
+                    break;
+                }
+                Ok(None) => break,
+                Err(_) => break,
             }
-            Ok(Some(AppServerEvent::Disconnected { message })) => {
-                tracing::warn!(
-                    thread_id,
-                    message,
-                    "temporary server request replay connection disconnected"
-                );
-                break;
-            }
-            Ok(None) => break,
-            Err(_) => break,
+        }
+        if let Err(error) = replay_client.shutdown().await {
+            tracing::debug!(
+                thread_id,
+                attempt,
+                error = %error,
+                "failed to shutdown temporary server request replay client"
+            );
+        }
+        tracing::info!(
+            thread_id,
+            attempt,
+            replayed_request_count,
+            "temporary server request replay attempt finished"
+        );
+        if accumulator.server_request_count > server_request_count_before_replay {
+            return Ok(());
         }
     }
-    if let Err(error) = replay_client.shutdown().await {
-        tracing::debug!(
-            thread_id,
-            error = %error,
-            "failed to shutdown temporary server request replay client"
-        );
-    }
-    tracing::info!(
+    tracing::warn!(
         thread_id,
-        replayed_request_count,
-        "temporary server request replay finished"
+        attempts = SERVER_REQUEST_REPLAY_ATTEMPTS,
+        replayed_request_count = total_replayed_request_count,
+        "server request replay finished without observing a pending request"
     );
     Ok(())
 }
