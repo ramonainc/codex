@@ -414,6 +414,7 @@ async fn ensure_thread(
                 approval_policy: Some(AskForApproval::Never),
                 approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
                 sandbox: Some(SandboxMode::DangerFullAccess),
+                config: Some(semaphore_thread_start_config_overrides()),
                 ephemeral: Some(false),
                 thread_source: Some(ThreadSource::Feature("semaphore_operator".to_string())),
                 experimental_raw_events: true,
@@ -879,6 +880,13 @@ fn optional_env(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn semaphore_thread_start_config_overrides() -> HashMap<String, Value> {
+    HashMap::from([(
+        "features.default_mode_request_user_input".to_string(),
+        json!(true),
+    )])
 }
 
 fn clean_optional_string(value: Option<&str>) -> Option<String> {
@@ -3411,6 +3419,16 @@ mod tests {
             Some("thread-1")
         );
         assert_eq!(clean_optional_string(Some("   ")), None);
+    }
+
+    #[test]
+    fn thread_start_config_enables_request_user_input_in_default_mode() {
+        let config = semaphore_thread_start_config_overrides();
+
+        assert_eq!(
+            config.get("features.default_mode_request_user_input"),
+            Some(&json!(true))
+        );
     }
 
     #[test]
