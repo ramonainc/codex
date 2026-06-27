@@ -140,8 +140,11 @@ fn event_requires_delivery(event: &InProcessServerEvent) -> bool {
     // These transcript and terminal events must remain lossless. Dropping
     // streamed assistant text or the authoritative completed item can leave
     // the TUI with permanently corrupted markdown, while dropping completion
-    // notifications can leave surfaces waiting forever.
+    // notifications can leave surfaces waiting forever. Server requests are
+    // also lossless because dropping them rejects approval and input flows
+    // before the caller has a chance to render or answer them.
     match event {
+        InProcessServerEvent::ServerRequest(_) => true,
         InProcessServerEvent::ServerNotification(notification) => {
             server_notification_requires_delivery(notification)
         }
@@ -1232,6 +1235,35 @@ mod tests {
         })
     }
 
+    fn request_user_input_server_request() -> ServerRequest {
+        ServerRequest::ToolRequestUserInput {
+            request_id: RequestId::Integer(7),
+            params: ToolRequestUserInputParams {
+                thread_id: "thread".to_string(),
+                turn_id: "turn".to_string(),
+                item_id: "call-1".to_string(),
+                questions: vec![ToolRequestUserInputQuestion {
+                    id: "repo".to_string(),
+                    header: "Repository".to_string(),
+                    question: "Which repository should Semaphore inspect first?".to_string(),
+                    is_other: false,
+                    is_secret: false,
+                    options: Some(vec![
+                        codex_app_server_protocol::ToolRequestUserInputOption {
+                            label: "ramonainc/test-repo".to_string(),
+                            description: "Primary validation repository".to_string(),
+                        },
+                        codex_app_server_protocol::ToolRequestUserInputOption {
+                            label: "ramonainc/test-repo-2".to_string(),
+                            description: "Secondary validation repository".to_string(),
+                        },
+                    ]),
+                }],
+                auto_resolution_ms: None,
+            },
+        }
+    }
+
     fn test_remote_connect_args(websocket_url: String) -> RemoteAppServerConnectArgs {
         RemoteAppServerConnectArgs {
             endpoint: RemoteAppServerEndpoint::WebSocket {
@@ -1445,6 +1477,76 @@ mod tests {
             InProcessServerEvent::ServerNotification(ServerNotification::TurnCompleted(
                 notification
             )) if notification.turn.status == codex_app_server_protocol::TurnStatus::Completed
+        ));
+    }
+
+    #[tokio::test]
+    async fn forward_in_process_event_preserves_server_requests_under_backpressure() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        event_tx
+            .send(InProcessServerEvent::ServerNotification(
+                command_execution_output_delta_notification("stdout-1"),
+            ))
+            .await
+            .expect("initial event should enqueue");
+
+        let mut skipped_events = 0usize;
+        let result = forward_in_process_event(
+            &event_tx,
+            &mut skipped_events,
+            InProcessServerEvent::ServerNotification(command_execution_output_delta_notification(
+                "stdout-2",
+            )),
+            |_| panic!("server request should not be rejected"),
+        )
+        .await;
+        assert_eq!(result, ForwardEventResult::Continue);
+        assert_eq!(skipped_events, 1);
+
+        let receive_task = tokio::spawn(async move {
+            let mut events = Vec::new();
+            for _ in 0..3 {
+                events.push(
+                    timeout(Duration::from_secs(2), event_rx.recv())
+                        .await
+                        .expect("event should arrive before timeout")
+                        .expect("event stream should stay open"),
+                );
+            }
+            events
+        });
+
+        let result = forward_in_process_event(
+            &event_tx,
+            &mut skipped_events,
+            InProcessServerEvent::ServerRequest(request_user_input_server_request()),
+            |_| panic!("lossless server request should not be rejected"),
+        )
+        .await;
+        assert_eq!(result, ForwardEventResult::Continue);
+        assert_eq!(skipped_events, 0);
+
+        let events = receive_task
+            .await
+            .expect("receiver task should join successfully");
+        assert!(matches!(
+            &events[0],
+            InProcessServerEvent::ServerNotification(
+                ServerNotification::CommandExecutionOutputDelta(notification)
+            ) if notification.delta == "stdout-1"
+        ));
+        assert!(matches!(
+            &events[1],
+            InProcessServerEvent::Lagged { skipped: 1 }
+        ));
+        assert!(matches!(
+            &events[2],
+            InProcessServerEvent::ServerRequest(ServerRequest::ToolRequestUserInput {
+                request_id,
+                params,
+            }) if *request_id == RequestId::Integer(7)
+                && params.item_id == "call-1"
+                && params.questions.len() == 1
         ));
     }
 
@@ -2134,6 +2236,9 @@ mod tests {
 
     #[test]
     fn event_requires_delivery_marks_transcript_and_terminal_events() {
+        assert!(event_requires_delivery(
+            &InProcessServerEvent::ServerRequest(request_user_input_server_request())
+        ));
         assert!(event_requires_delivery(
             &InProcessServerEvent::ServerNotification(
                 codex_app_server_protocol::ServerNotification::TurnCompleted(
