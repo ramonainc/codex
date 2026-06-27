@@ -25,7 +25,7 @@ use codex_app_server_protocol::{
 };
 use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 const RESULT_MARKER: &str = "SEMAPHORE_CODEX_APP_SERVER_TURN_RESULT_V1";
 const CONTROL_RESULT_MARKER: &str = "SEMAPHORE_CODEX_APP_SERVER_CONTROL_RESULT_V1";
@@ -287,6 +287,17 @@ async fn run_turn(command: TurnCommand) -> Result<()> {
         .await
         .context("turn/start failed")?;
 
+    if !thread.reused {
+        rejoin_new_thread_after_turn_start(
+            &client,
+            &mut request_ids,
+            &thread.id,
+            &command,
+            cwd_string.clone(),
+        )
+        .await;
+    }
+
     let mut accumulator = TurnAccumulator::default();
     let deadline = Instant::now() + timeout_duration;
     loop {
@@ -419,18 +430,6 @@ async fn ensure_thread(
         })
         .await
         .context("thread/start failed")?;
-    let _: ThreadResumeResponse = client
-        .request_typed(ClientRequest::ThreadResume {
-            request_id: request_ids.next(),
-            params: semaphore_thread_resume_params(
-                started.thread.id.clone(),
-                command.model.clone(),
-                cwd_string,
-                None,
-            ),
-        })
-        .await
-        .context("thread/resume after thread/start failed")?;
     Ok(PreparedThread {
         id: started.thread.id,
         session_id: started.thread.session_id,
@@ -438,6 +437,50 @@ async fn ensure_thread(
         mode: "start_new",
         history_replay_summary: None,
     })
+}
+
+async fn rejoin_new_thread_after_turn_start(
+    client: &RemoteAppServerClient,
+    request_ids: &mut RequestIds,
+    thread_id: &str,
+    command: &TurnCommand,
+    cwd_string: Option<String>,
+) {
+    const REJOIN_ATTEMPTS: usize = 3;
+    for attempt in 1..=REJOIN_ATTEMPTS {
+        let result = client
+            .request_typed::<ThreadResumeResponse>(ClientRequest::ThreadResume {
+                request_id: request_ids.next(),
+                params: semaphore_thread_resume_params(
+                    thread_id.to_string(),
+                    command.model.clone(),
+                    cwd_string.clone(),
+                    None,
+                ),
+            })
+            .await;
+        match result {
+            Ok(_) => {
+                tracing::info!(
+                    thread_id,
+                    attempt,
+                    "rejoined new Semaphore Codex thread after turn/start"
+                );
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    thread_id,
+                    attempt,
+                    error = %error,
+                    "failed to rejoin new Semaphore Codex thread after turn/start"
+                );
+                if attempt < REJOIN_ATTEMPTS {
+                    sleep(Duration::from_millis(250)).await;
+                }
+            }
+        }
+    }
 }
 
 async fn run_steer(command: TurnSteerCommand) -> Result<()> {
