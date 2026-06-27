@@ -36,6 +36,7 @@ const BRIDGE_SCHEMA_VERSION: i32 = 1;
 const BRIDGE_REQUEST_TIMEOUT_SECONDS: u64 = 2;
 const RESUME_HISTORY_TURN_LIMIT: u32 = 8;
 const RESUME_HISTORY_COUNT_LIMIT: usize = 12;
+const REQUEST_USER_INPUT_REPLAY_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Semaphore runner for Codex app-server turns")]
@@ -182,6 +183,8 @@ struct TurnAccumulator {
     item_completed_count: u64,
     server_request_count: u64,
     auto_approved_request_count: u64,
+    user_input_request_count: u64,
+    user_input_replay_attempted: bool,
     interrupted: bool,
 }
 
@@ -311,9 +314,12 @@ async fn run_turn(command: TurnCommand) -> Result<()> {
         accumulator.event_count += 1;
         if handle_event(
             &client,
+            &mut request_ids,
             event,
             &thread.id,
             &turn.turn.id,
+            &command.model,
+            cwd_string.as_deref(),
             &mut accumulator,
             bridge.as_mut(),
         )
@@ -726,9 +732,12 @@ fn json_string_array(value: &Value, key: &str) -> Vec<String> {
 
 async fn handle_event(
     client: &RemoteAppServerClient,
+    request_ids: &mut RequestIds,
     event: AppServerEvent,
     thread_id: &str,
     turn_id: &str,
+    model: &str,
+    cwd: Option<&str>,
     accumulator: &mut TurnAccumulator,
     bridge: Option<&mut BridgeForwarder>,
 ) -> Result<bool> {
@@ -742,6 +751,9 @@ async fn handle_event(
         AppServerEvent::ServerRequest(request) => {
             accumulator.server_request_count += 1;
             let method = server_request_method_name(&request);
+            if method == "item/tool/requestUserInput" {
+                accumulator.user_input_request_count += 1;
+            }
             let server_request_id = server_request_id_string(&request);
             let request_summary = server_request_payload_summary(&request);
             if auto_resolve_server_request(client, request).await? {
@@ -774,6 +786,8 @@ async fn handle_event(
             }
         }
         AppServerEvent::ServerNotification(notification) => {
+            let waiting_on_user_input =
+                notification_waits_on_user_input(&notification, thread_id, turn_id);
             if let Some(bridge) = bridge {
                 bridge
                     .forward_notification(&notification, accumulator.event_count)
@@ -782,9 +796,61 @@ async fn handle_event(
             if handle_notification(notification, thread_id, turn_id, accumulator)? {
                 return Ok(true);
             }
+            if waiting_on_user_input {
+                replay_pending_user_input_request(
+                    client,
+                    request_ids,
+                    thread_id,
+                    model,
+                    cwd,
+                    accumulator,
+                )
+                .await;
+            }
         }
     }
     Ok(false)
+}
+
+async fn replay_pending_user_input_request(
+    client: &RemoteAppServerClient,
+    request_ids: &mut RequestIds,
+    thread_id: &str,
+    model: &str,
+    cwd: Option<&str>,
+    accumulator: &mut TurnAccumulator,
+) {
+    if accumulator.user_input_request_count > 0 || accumulator.user_input_replay_attempted {
+        return;
+    }
+    accumulator.user_input_replay_attempted = true;
+    tracing::warn!(
+        thread_id,
+        "thread is waiting on request_user_input but no server request has been observed; replaying pending requests"
+    );
+    sleep(REQUEST_USER_INPUT_REPLAY_DELAY).await;
+    let result = client
+        .request_typed::<ThreadResumeResponse>(ClientRequest::ThreadResume {
+            request_id: request_ids.next(),
+            params: semaphore_thread_resume_params(
+                thread_id.to_string(),
+                model.to_string(),
+                cwd.map(ToOwned::to_owned),
+                None,
+            ),
+        })
+        .await;
+    match result {
+        Ok(_) => tracing::info!(
+            thread_id,
+            "replayed pending request_user_input server requests after waiting status"
+        ),
+        Err(error) => tracing::warn!(
+            thread_id,
+            error = %error,
+            "failed to replay pending request_user_input server requests after waiting status"
+        ),
+    }
 }
 
 struct BridgeForwarder {
@@ -1029,6 +1095,35 @@ fn notification_bridge_payload(
         "eventCount": event_count,
         "payloadSummary": notification_payload_summary(&value),
     })
+}
+
+fn notification_waits_on_user_input(
+    notification: &ServerNotification,
+    thread_id: &str,
+    _turn_id: &str,
+) -> bool {
+    let Ok(value) = serde_json::to_value(notification) else {
+        return false;
+    };
+    if value.get("method").and_then(Value::as_str) != Some("thread/status/changed") {
+        return false;
+    }
+    if notification_param_string(&value, "threadId").as_deref() != Some(thread_id) {
+        return false;
+    }
+    let Some(status) = value.get("params").and_then(|params| params.get("status")) else {
+        return false;
+    };
+    if status.get("type").and_then(Value::as_str) != Some("active") {
+        return false;
+    }
+    status
+        .get("activeFlags")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(|flag| flag == "waitingOnUserInput")
 }
 
 fn server_request_bridge_payload(
@@ -3412,7 +3507,8 @@ fn request_id_string(request_id: &RequestId) -> String {
 #[cfg(test)]
 mod tests {
     use codex_app_server_protocol::{
-        CommandExecutionOutputDeltaNotification, CurrentTimeReadParams, ToolRequestUserInputOption,
+        CommandExecutionOutputDeltaNotification, CurrentTimeReadParams, ThreadActiveFlag,
+        ThreadStatus, ThreadStatusChangedNotification, ToolRequestUserInputOption,
         ToolRequestUserInputQuestion, Turn, TurnItemsView, TurnStartedNotification,
     };
 
@@ -4249,6 +4345,52 @@ mod tests {
         assert_eq!(model_summary["fromModel"], "gpt-5");
         assert_eq!(model_summary["toModel"], "gpt-5-mini");
         assert_eq!(model_summary["reason"], "highRiskCyberActivity");
+    }
+
+    #[test]
+    fn notification_waits_on_user_input_detects_active_thread_status() {
+        let notification =
+            ServerNotification::ThreadStatusChanged(ThreadStatusChangedNotification {
+                thread_id: "thread-1".to_string(),
+                status: ThreadStatus::Active {
+                    active_flags: vec![
+                        ThreadActiveFlag::WaitingOnApproval,
+                        ThreadActiveFlag::WaitingOnUserInput,
+                    ],
+                },
+            });
+
+        assert!(notification_waits_on_user_input(
+            &notification,
+            "thread-1",
+            "turn-1"
+        ));
+        assert!(!notification_waits_on_user_input(
+            &notification,
+            "thread-2",
+            "turn-1"
+        ));
+
+        let approval_only =
+            ServerNotification::ThreadStatusChanged(ThreadStatusChangedNotification {
+                thread_id: "thread-1".to_string(),
+                status: ThreadStatus::Active {
+                    active_flags: vec![ThreadActiveFlag::WaitingOnApproval],
+                },
+            });
+        assert!(!notification_waits_on_user_input(
+            &approval_only,
+            "thread-1",
+            "turn-1"
+        ));
+
+        let idle = ServerNotification::ThreadStatusChanged(ThreadStatusChangedNotification {
+            thread_id: "thread-1".to_string(),
+            status: ThreadStatus::Idle,
+        });
+        assert!(!notification_waits_on_user_input(
+            &idle, "thread-1", "turn-1"
+        ));
     }
 
     #[test]

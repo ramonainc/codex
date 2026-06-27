@@ -10,6 +10,8 @@ use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ServerRequestResolvedNotification;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::ThreadResumeParams;
+use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput as V2UserInput;
@@ -19,6 +21,8 @@ use codex_protocol::config_types::Settings;
 use codex_protocol::openai_models::ReasoningEffort;
 use core_test_support::responses;
 use serde_json::json;
+use std::collections::HashMap;
+use std::time::Duration;
 use tokio::time::timeout;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -156,6 +160,115 @@ async fn request_user_input_round_trip() -> Result<()> {
             _ => {}
         }
     }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn request_user_input_survives_raw_events_default_mode_and_running_resume() -> Result<()> {
+    let codex_home = tempfile::TempDir::new()?;
+    let responses = vec![
+        create_request_user_input_sse_response_with_auto_resolution(
+            "call1", /*auto_resolution_ms*/ 60_000,
+        )?,
+        create_final_assistant_message_sse_response("done")?,
+    ];
+    let server = create_mock_responses_server_sequence(responses).await;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_start_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            config: Some(HashMap::from([(
+                "features.default_mode_request_user_input".to_string(),
+                json!(true),
+            )])),
+            experimental_raw_events: true,
+            ..Default::default()
+        })
+        .await?;
+    let thread_start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response(thread_start_resp)?;
+
+    let turn_start_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            client_user_message_id: None,
+            input: vec![V2UserInput::Text {
+                text: "ask something".to_string(),
+                text_elements: Vec::new(),
+            }],
+            model: Some("mock-model".to_string()),
+            effort: Some(ReasoningEffort::Medium),
+            ..Default::default()
+        })
+        .await?;
+    let turn_start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_start_id)),
+    )
+    .await??;
+    let TurnStartResponse { turn, .. } = to_response(turn_start_resp)?;
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread.id.clone(),
+            model: Some("mock-model".to_string()),
+            config: Some(HashMap::from([(
+                "features.default_mode_request_user_input".to_string(),
+                json!(true),
+            )])),
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse {
+        thread: resumed_thread,
+        ..
+    } = to_response(resume_resp)?;
+    assert_eq!(resumed_thread.id, thread.id);
+
+    let server_req = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_request_message(),
+    )
+    .await??;
+    let ServerRequest::ToolRequestUserInput { request_id, params } = server_req else {
+        panic!("expected ToolRequestUserInput request, got: {server_req:?}");
+    };
+
+    assert_eq!(params.thread_id, thread.id);
+    assert_eq!(params.turn_id, turn.id);
+    assert_eq!(params.item_id, "call1");
+    assert_eq!(params.questions.len(), 1);
+
+    mcp.send_response(
+        request_id,
+        serde_json::json!({
+            "answers": {
+                "confirm_path": { "answers": ["yes"] }
+            }
+        }),
+    )
+    .await?;
+
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
 
     Ok(())
 }
