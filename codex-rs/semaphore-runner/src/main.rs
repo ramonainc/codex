@@ -3108,6 +3108,9 @@ fn insert_hook_run_summary(summary: &mut serde_json::Map<String, Value>, run: &V
         summary.insert("hookEntryCount".to_string(), json!(entries.len()));
         let mut kind_counts = serde_json::Map::new();
         let mut output_bytes = 0usize;
+        let mut output_preview = String::new();
+        let mut output_preview_chars = 0usize;
+        let mut output_preview_truncated = false;
         for entry in entries {
             if let Some(kind) = entry.get("kind").and_then(Value::as_str) {
                 let count = kind_counts.get(kind).and_then(Value::as_u64).unwrap_or(0) + 1;
@@ -3115,6 +3118,13 @@ fn insert_hook_run_summary(summary: &mut serde_json::Map<String, Value>, run: &V
             }
             if let Some(text) = entry.get("text").and_then(Value::as_str) {
                 output_bytes = output_bytes.saturating_add(text.len());
+                append_bounded_hook_output_preview(
+                    &mut output_preview,
+                    &mut output_preview_chars,
+                    &mut output_preview_truncated,
+                    text,
+                    4_096,
+                );
             }
         }
         summary.insert(
@@ -3122,6 +3132,38 @@ fn insert_hook_run_summary(summary: &mut serde_json::Map<String, Value>, run: &V
             Value::Object(kind_counts),
         );
         summary.insert("hookOutputTextByteCount".to_string(), json!(output_bytes));
+        if output_preview_truncated && !output_preview.trim().is_empty() {
+            summary.insert("hookOutputText".to_string(), json!(output_preview));
+            summary.insert("hookOutputTextTruncated".to_string(), json!(true));
+        }
+    }
+}
+
+fn append_bounded_hook_output_preview(
+    output: &mut String,
+    output_chars: &mut usize,
+    output_truncated: &mut bool,
+    text: &str,
+    max_chars: usize,
+) {
+    if *output_truncated || text.is_empty() {
+        return;
+    }
+    if !output.is_empty() {
+        if *output_chars >= max_chars {
+            *output_truncated = true;
+            return;
+        }
+        output.push('\n');
+        *output_chars += 1;
+    }
+    for character in text.chars() {
+        if *output_chars >= max_chars {
+            *output_truncated = true;
+            return;
+        }
+        output.push(character);
+        *output_chars += 1;
     }
 }
 
@@ -4811,8 +4853,34 @@ mod tests {
         assert_eq!(hook_summary["hookDurationMs"], 12);
         assert_eq!(hook_summary["hookEntryCount"], 1);
         assert_eq!(hook_summary["hookOutputTextByteCount"], 11);
+        assert!(hook_summary.get("hookOutputText").is_none());
+        assert!(hook_summary.get("hookOutputTextTruncated").is_none());
         assert!(hook_summary.get("entries").is_none());
         assert!(!hook_summary.to_string().contains("SECRET_HOOK"));
+
+        let truncated_hook_summary = notification_payload_summary(&json!({
+            "method": "hook/completed",
+            "params": {
+                "run": {
+                    "id": "hook-2",
+                    "eventName": "PostToolUse",
+                    "status": "completed",
+                    "entries": [
+                        {"kind": "stdout", "text": "x".repeat(4_200)}
+                    ]
+                }
+            }
+        }));
+        assert_eq!(truncated_hook_summary["hookOutputTextByteCount"], 4200);
+        assert_eq!(truncated_hook_summary["hookOutputTextTruncated"], true);
+        assert_eq!(
+            truncated_hook_summary["hookOutputText"]
+                .as_str()
+                .expect("hook output preview")
+                .len(),
+            4096
+        );
+        assert!(truncated_hook_summary.get("entries").is_none());
 
         let raw_response_summary = notification_payload_summary(&json!({
             "method": "rawResponseItem/completed",
