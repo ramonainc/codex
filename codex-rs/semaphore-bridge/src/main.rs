@@ -830,6 +830,48 @@ async fn handle_bridge_command(
                 Err(error)
             }
         },
+        "thread.history_replay" => {
+            match execute_thread_history_replay_command(args, &command).await {
+                Ok(result) => send_bridge_status_event(
+                    args,
+                    transport,
+                    spool,
+                    bridge_epoch,
+                    sequence,
+                    "bridge.command_succeeded",
+                    json!({
+                        "source": "semaphore-sandbox-bridge",
+                        "message": "Bridge command completed: thread.history_replay",
+                        "bridgeCommandId": command.id,
+                        "commandType": command.command_type,
+                        "result": result,
+                    }),
+                    true,
+                )
+                .await
+                .map(|_| ()),
+                Err(error) => {
+                    send_bridge_status_event(
+                        args,
+                        transport,
+                        spool,
+                        bridge_epoch,
+                        sequence,
+                        "bridge.command_failed",
+                        json!({
+                            "source": "semaphore-sandbox-bridge",
+                            "message": "Bridge command failed: thread.history_replay",
+                            "bridgeCommandId": command.id,
+                            "commandType": command.command_type,
+                            "error": error.to_string(),
+                        }),
+                        true,
+                    )
+                    .await?;
+                    Err(error)
+                }
+            }
+        }
         "turn.steer" | "turn.interrupt" | "server_request.respond" => {
             match execute_turn_control_command(&command).await {
                 Ok(result) => {
@@ -1016,6 +1058,52 @@ async fn execute_turn_start_command(
     parse_turn_result(&stdout)
 }
 
+async fn execute_thread_history_replay_command(
+    args: &Args,
+    command: &BridgeCommand,
+) -> Result<Value> {
+    let runner = semaphore_codex_runner_bin().context("semaphore-codex-runner is not installed")?;
+    let invocation = thread_history_replay_runner_invocation(command)?;
+    let rust_log = env::var("RUST_LOG").unwrap_or_else(|_| "warn".to_string());
+    let mut process = Command::new(runner);
+    process.args(invocation.args);
+    process
+        .env(
+            "SEMAPHORE_API_BASE_URL",
+            args.api_base_url.trim_end_matches('/'),
+        )
+        .env(
+            "SEMAPHORE_ORGANIZATION_ID",
+            args.organization_id.to_string(),
+        )
+        .env("SEMAPHORE_PRODUCT_SESSION_ID", args.session_id.to_string())
+        .env("SEMAPHORE_RUNTIME_ID", args.runtime_id.to_string())
+        .env("SEMAPHORE_SANDBOX_BRIDGE_TOKEN", args.bridge_token.clone())
+        .env("NO_COLOR", "1")
+        .env("RUST_LOG", rust_log);
+    if let Some(codex_home) = invocation.codex_home {
+        process.env("CODEX_HOME", codex_home);
+    }
+    let output = tokio::time::timeout(Duration::from_secs(30), process.output())
+        .await
+        .context("timed out waiting for semaphore-codex-runner thread replay command")?
+        .context("failed to execute semaphore-codex-runner thread replay command")?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if !output.status.success() {
+        bail!(
+            "semaphore-codex-runner thread replay exited with {}: {}",
+            output
+                .status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".to_string()),
+            command_output_summary(&stdout, &stderr)
+        );
+    }
+    parse_control_result(&stdout)
+}
+
 fn turn_start_runner_args(
     websocket_url: &str,
     model: &str,
@@ -1044,6 +1132,37 @@ fn turn_start_runner_args(
         args.push(context.to_string());
     }
     args
+}
+
+struct ThreadHistoryReplayRunnerInvocation {
+    codex_home: Option<String>,
+    args: Vec<String>,
+}
+
+fn thread_history_replay_runner_invocation(
+    command: &BridgeCommand,
+) -> Result<ThreadHistoryReplayRunnerInvocation> {
+    let thread_id = command_payload_string(command, "threadId")
+        .context("thread.history_replay command is missing threadId")?;
+    let websocket_url = command_payload_string(command, "appServerWs")
+        .unwrap_or_else(|| DEFAULT_CODEX_APP_SERVER_WS.to_string());
+    let model =
+        command_payload_string(command, "model").unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    let codex_home = command_payload_string(command, "codexHome");
+    let cwd = command_payload_string(command, "workspaceDir");
+    let mut args = vec![
+        "replay".to_string(),
+        "--websocket-url".to_string(),
+        websocket_url,
+        "--model".to_string(),
+        model,
+        "--thread-id".to_string(),
+        thread_id,
+    ];
+    if let Some(cwd) = cwd {
+        args.extend(["--cwd".to_string(), cwd]);
+    }
+    Ok(ThreadHistoryReplayRunnerInvocation { codex_home, args })
 }
 
 async fn wait_for_turn_runner_with_control(
@@ -1782,6 +1901,42 @@ mod tests {
                 "turn-1",
                 "--client-message-id",
                 "client-message-1",
+            ]
+        );
+    }
+
+    #[test]
+    fn thread_history_replay_runner_args_resume_existing_thread() {
+        let command = BridgeCommand {
+            id: Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap(),
+            command_type: "thread.history_replay".to_string(),
+            payload: json!({
+                "threadId": "thread-1",
+                "appServerWs": "ws://127.0.0.1:43113",
+                "model": "gpt-validation",
+                "workspaceDir": "/home/daytona/workspace/app",
+                "codexHome": "/home/daytona/.semaphore-codex-app-server-home/sessions/session-1"
+            }),
+        };
+
+        let invocation = thread_history_replay_runner_invocation(&command).unwrap();
+
+        assert_eq!(
+            invocation.codex_home.as_deref(),
+            Some("/home/daytona/.semaphore-codex-app-server-home/sessions/session-1")
+        );
+        assert_eq!(
+            invocation.args,
+            vec![
+                "replay",
+                "--websocket-url",
+                "ws://127.0.0.1:43113",
+                "--model",
+                "gpt-validation",
+                "--thread-id",
+                "thread-1",
+                "--cwd",
+                "/home/daytona/workspace/app",
             ]
         );
     }

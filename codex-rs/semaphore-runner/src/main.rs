@@ -55,6 +55,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Turn(TurnCommand),
+    Replay(ThreadReplayCommand),
     Steer(TurnSteerCommand),
     Interrupt(TurnInterruptCommand),
     ServerRequest(ServerRequestCommand),
@@ -82,6 +83,20 @@ struct TurnCommand {
     product_turn_id: Option<String>,
     #[arg(long, env = "SEMAPHORE_CODEX_TIMEOUT_SECONDS", default_value_t = DEFAULT_TIMEOUT_SECONDS)]
     timeout_seconds: u64,
+}
+
+#[derive(Debug, Parser)]
+struct ThreadReplayCommand {
+    #[arg(long, env = "SEMAPHORE_CODEX_APP_SERVER_WS", default_value = DEFAULT_WEBSOCKET_URL)]
+    websocket_url: String,
+    #[arg(long, env = "SEMAPHORE_CODEX_MODEL", default_value = DEFAULT_MODEL)]
+    model: String,
+    #[arg(long, env = "SEMAPHORE_CODEX_CWD")]
+    cwd: Option<PathBuf>,
+    #[arg(long)]
+    thread_id: String,
+    #[arg(long, env = "SEMAPHORE_PRODUCT_TURN_ID")]
+    product_turn_id: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -180,6 +195,19 @@ struct ControlResult {
     accepted: bool,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadReplayResult {
+    schema_version: u8,
+    source: &'static str,
+    command: &'static str,
+    thread_id: String,
+    codex_session_id: String,
+    product_turn_id: Option<String>,
+    workspace_dir: Option<String>,
+    replay: Value,
+}
+
 #[derive(Debug, Default)]
 struct TurnAccumulator {
     response_delta: String,
@@ -229,6 +257,7 @@ async fn main() -> Result<()> {
 
     match Cli::parse().command {
         Command::Turn(command) => run_turn(command).await,
+        Command::Replay(command) => run_thread_replay(command).await,
         Command::Steer(command) => run_steer(command).await,
         Command::Interrupt(command) => run_interrupt(command).await,
         Command::ServerRequest(command) => run_server_request(command).await,
@@ -406,6 +435,57 @@ async fn run_turn(command: TurnCommand) -> Result<()> {
     Ok(())
 }
 
+async fn run_thread_replay(command: ThreadReplayCommand) -> Result<()> {
+    let cwd_string = command
+        .cwd
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string());
+    let client = connect_app_server(&command.websocket_url).await?;
+    let mut request_ids = RequestIds::new();
+    let mut bridge = match BridgeForwarder::from_env(command.product_turn_id.clone()) {
+        Ok(bridge) => bridge,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "Codex runner bridge forwarding is disabled"
+            );
+            None
+        }
+    };
+    let resumed = resume_thread_with_history_page(
+        &client,
+        &mut request_ids,
+        command.thread_id.clone(),
+        command.model,
+        cwd_string.clone(),
+    )
+    .await?;
+    let replay = thread_history_replay_summary(&resumed);
+    if let Some(bridge) = bridge.as_mut() {
+        bridge
+            .forward_thread_history_replay(&resumed.thread.id, &replay)
+            .await;
+    }
+    client
+        .shutdown()
+        .await
+        .context("failed to shutdown Codex app-server client")?;
+
+    let result = ThreadReplayResult {
+        schema_version: 1,
+        source: "codex_app_server_remote_client",
+        command: "thread.history_replay",
+        thread_id: resumed.thread.id,
+        codex_session_id: resumed.thread.session_id,
+        product_turn_id: command.product_turn_id,
+        workspace_dir: cwd_string,
+        replay,
+    };
+    println!("{CONTROL_RESULT_MARKER}");
+    println!("{}", serde_json::to_string(&result)?);
+    Ok(())
+}
+
 struct PreparedThread {
     id: String,
     session_id: String,
@@ -421,22 +501,14 @@ async fn ensure_thread(
     cwd_string: Option<String>,
 ) -> Result<PreparedThread> {
     if let Some(thread_id) = clean_optional_string(command.thread_id.as_deref()) {
-        let resumed: ThreadResumeResponse = client
-            .request_typed(ClientRequest::ThreadResume {
-                request_id: request_ids.next(),
-                params: semaphore_thread_resume_params(
-                    thread_id,
-                    command.model.clone(),
-                    cwd_string,
-                    Some(ThreadResumeInitialTurnsPageParams {
-                        limit: Some(RESUME_HISTORY_TURN_LIMIT),
-                        sort_direction: None,
-                        items_view: Some(TurnItemsView::Summary),
-                    }),
-                ),
-            })
-            .await
-            .context("thread/resume failed")?;
+        let resumed = resume_thread_with_history_page(
+            client,
+            request_ids,
+            thread_id,
+            command.model.clone(),
+            cwd_string,
+        )
+        .await?;
         let history_replay_summary = thread_history_replay_summary(&resumed);
         return Ok(PreparedThread {
             id: resumed.thread.id,
@@ -473,6 +545,31 @@ async fn ensure_thread(
         mode: "start_new",
         history_replay_summary: None,
     })
+}
+
+async fn resume_thread_with_history_page(
+    client: &RemoteAppServerClient,
+    request_ids: &mut RequestIds,
+    thread_id: String,
+    model: String,
+    cwd: Option<String>,
+) -> Result<ThreadResumeResponse> {
+    client
+        .request_typed(ClientRequest::ThreadResume {
+            request_id: request_ids.next(),
+            params: semaphore_thread_resume_params(
+                thread_id,
+                model,
+                cwd,
+                Some(ThreadResumeInitialTurnsPageParams {
+                    limit: Some(RESUME_HISTORY_TURN_LIMIT),
+                    sort_direction: None,
+                    items_view: Some(TurnItemsView::Summary),
+                }),
+            ),
+        })
+        .await
+        .context("thread/resume failed")
 }
 
 async fn rejoin_new_thread_after_turn_start(
@@ -4082,6 +4179,35 @@ mod tests {
         assert_eq!(payload["notificationMethod"], "thread/history/replayed");
         assert_eq!(payload["productTurnId"], "product-turn-1");
         assert_eq!(payload["payloadSummary"]["itemCount"], 2);
+    }
+
+    #[test]
+    fn thread_replay_result_contains_bounded_summary_only() {
+        let result = ThreadReplayResult {
+            schema_version: 1,
+            source: "codex_app_server_remote_client",
+            command: "thread.history_replay",
+            thread_id: "thread-1".to_string(),
+            codex_session_id: "session-1".to_string(),
+            product_turn_id: None,
+            workspace_dir: Some("/home/daytona/workspace/app".to_string()),
+            replay: json!({
+                "threadId": "thread-1",
+                "codexSessionId": "session-1",
+                "turnCount": 1,
+                "itemCount": 2,
+                "itemKindCounts": {
+                    "commandExecution": 2
+                }
+            }),
+        };
+
+        let value = serde_json::to_value(result).unwrap();
+
+        assert_eq!(value["command"], "thread.history_replay");
+        assert_eq!(value["replay"]["turnCount"], 1);
+        assert_eq!(value["replay"]["itemCount"], 2);
+        assert!(!value.to_string().contains("do not expose"));
     }
 
     #[test]
